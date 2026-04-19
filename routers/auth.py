@@ -6,14 +6,21 @@ from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import httpx
+import redis.exceptions as redis_exc
 from fastapi import APIRouter, Request
 
 from core.config import get_settings
 from core.database import get_supabase, get_supabase_admin
-from core.redis_client import get_async_redis
+from core.redis_client import get_async_redis, reset_async_redis
 from core.responses import error_response, success_response
 from core.security import create_access_token, create_refresh_token_value
-from models.auth import GoogleAuthRequest, LoginRequest, RefreshRequest, RegisterRequest
+from models.auth import (
+    GoogleAuthRequest,
+    LoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+    SupabaseSessionRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -27,24 +34,35 @@ async def _store_refresh(refresh_token: str, user_id: str) -> None:
     ttl = int(timedelta(days=settings.refresh_token_expire_days).total_seconds())
     r = await get_async_redis()
     if r:
-        await r.setex(f"refresh:{refresh_token}", ttl, user_id)
-    else:
-        _refresh_memory[refresh_token] = user_id
+        try:
+            await r.setex(f"refresh:{refresh_token}", ttl, user_id)
+            return
+        except redis_exc.RedisError as exc:
+            logger.warning("Redis setex refresh indisponible, fallback mémoire: %s", exc)
+            reset_async_redis()
+    _refresh_memory[refresh_token] = user_id
 
 
 async def _get_refresh_user(refresh_token: str) -> Optional[str]:
     r = await get_async_redis()
     if r:
-        return await r.get(f"refresh:{refresh_token}")
+        try:
+            return await r.get(f"refresh:{refresh_token}")
+        except redis_exc.RedisError as exc:
+            logger.warning("Redis get refresh: %s", exc)
+            reset_async_redis()
     return _refresh_memory.get(refresh_token)
 
 
 async def _delete_refresh(refresh_token: str) -> None:
     r = await get_async_redis()
     if r:
-        await r.delete(f"refresh:{refresh_token}")
-    else:
-        _refresh_memory.pop(refresh_token, None)
+        try:
+            await r.delete(f"refresh:{refresh_token}")
+        except redis_exc.RedisError as exc:
+            logger.warning("Redis delete refresh: %s", exc)
+            reset_async_redis()
+    _refresh_memory.pop(refresh_token, None)
 
 
 def _tokens_payload(user_id: str, email: Optional[str]) -> Dict[str, Any]:
@@ -68,11 +86,14 @@ async def register(body: RegisterRequest, request: Request):
         return error_response("Supabase non configuré", 503)
     try:
         display = (body.name or "").strip()
+        settings = get_settings()
+        redirect = settings.public_app_url.rstrip("/") + "/"
         res = client.auth.sign_up(
             {
                 "email": body.email,
                 "password": body.password,
                 "options": {
+                    "email_redirect_to": redirect,
                     "data": {
                         "full_name": display,
                         "name": display,
@@ -125,11 +146,54 @@ async def login(body: LoginRequest):
     user = getattr(res, "user", None)
     if not user:
         return error_response("Identifiants invalides", 401)
-    uid = str(user.id)
-    email = user.email
-    payload = _tokens_payload(uid, email)
-    await _store_refresh(payload["refresh_token"], uid)
-    return success_response(payload, "Connexion réussie")
+    try:
+        uid = str(user.id)
+        email = user.email
+        payload = _tokens_payload(uid, email)
+        await _store_refresh(payload["refresh_token"], uid)
+        return success_response(payload, "Connexion réussie")
+    except Exception:
+        logger.exception("login: échec après sign_in Supabase")
+        return error_response("Erreur serveur lors de la connexion", 500)
+
+
+@router.post("/supabase-session")
+async def supabase_session(body: SupabaseSessionRequest):
+    """
+    Échange le JWT utilisateur Supabase (fragment #access_token après clic sur le lien
+    de confirmation e-mail) contre les jetons applicatifs (JWT SAYIBI + refresh).
+    """
+    settings = get_settings()
+    if not settings.supabase_url or not settings.supabase_key:
+        return error_response("Supabase non configuré", 503)
+    url = f"{settings.supabase_url.rstrip('/')}/auth/v1/user"
+    headers = {
+        "apikey": settings.supabase_key,
+        "Authorization": f"Bearer {body.supabase_access_token}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as hc:
+            r = await hc.get(url, headers=headers)
+    except Exception as e:
+        logger.warning("supabase-session: erreur HTTP %s", e)
+        return error_response("Impossible de joindre Supabase", 502)
+    if r.status_code >= 400:
+        return error_response("Session Supabase invalide ou expirée", 401)
+    try:
+        user = r.json()
+    except Exception:
+        return error_response("Réponse Supabase invalide", 502)
+    uid = user.get("id")
+    if not uid:
+        return error_response("Utilisateur introuvable", 401)
+    email = user.get("email")
+    try:
+        payload = _tokens_payload(str(uid), email)
+        await _store_refresh(payload["refresh_token"], str(uid))
+        return success_response(payload, "Session établie")
+    except Exception:
+        logger.exception("supabase-session: échec après validation Supabase")
+        return error_response("Erreur serveur lors de l'établissement de session", 500)
 
 
 @router.post("/refresh")

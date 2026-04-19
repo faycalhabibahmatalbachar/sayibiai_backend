@@ -76,6 +76,13 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("SUPABASE_ANON_KEY", "SUPABASE_KEY", "supabase_key"),
     )
+    # URL publique du front Flutter web (lien de confirmation e-mail Supabase).
+    # Déployer un site statique Render nommé ex. sayibi-web → https://sayibi-web.onrender.com
+    public_app_url: str = Field(
+        default="https://sayibi-web.onrender.com",
+        validation_alias=AliasChoices("PUBLIC_APP_URL", "public_app_url"),
+    )
+
     supabase_service_role_key: str = Field(
         default="",
         validation_alias=AliasChoices(
@@ -165,7 +172,7 @@ class Settings(BaseSettings):
     debug: bool = False
     trusted_hosts: str = Field(
         # *.onrender.com : accepte tout sous-domaine Render (ex. sayibi-backend-xxxx.onrender.com).
-        default="*.onrender.com,sayibi-backend.onrender.com,api.sayibi.app,localhost,127.0.0.1",
+        default="*.onrender.com,sayibi-backend.onrender.com,sayibi-web.onrender.com,localhost,127.0.0.1",
         validation_alias=AliasChoices("TRUSTED_HOSTS", "trusted_hosts"),
     )
 

@@ -20,6 +20,12 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class SupabaseSessionRequest(BaseModel):
+    """Jeton utilisateur Supabase (URL #access_token après confirmation e-mail)."""
+
+    supabase_access_token: str = Field(..., min_length=20)
+
+
 class GoogleAuthRequest(BaseModel):
     """Jeton ID Google (ou access_token) selon le flux client."""
     id_token: Optional[str] = None

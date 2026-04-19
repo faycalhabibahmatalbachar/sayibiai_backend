@@ -103,6 +103,10 @@ async def post_message(body: ChatMessageRequest, user_id: str = Depends(get_curr
             body.personality,
             bool(body.expert_mode),
             need_vision=False,
+            force_web_search=bool(body.web_search),
+            document_id=body.document_id,
+            create_mode=bool(body.create_mode),
+            create_type=body.create_type,
         )
     except Exception as e:
         return error_response(str(e), 500)
@@ -138,6 +142,10 @@ async def post_stream(body: ChatStreamRequest, user_id: str = Depends(get_curren
                 body.model_preference,
                 body.personality,
                 bool(body.expert_mode),
+                force_web_search=bool(body.web_search),
+                document_id=body.document_id,
+                create_mode=bool(body.create_mode),
+                create_type=body.create_type,
             ):
                 full.append(chunk)
                 yield f"data: {json.dumps({'chunk': chunk})}\n\n"

@@ -6,6 +6,10 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 from langdetect import detect
 
 from core.config import get_settings
+from core.models_config import (
+    augment_message_for_create_mode,
+    resolve_sayibi_preference,
+)
 from services import gemini_service, groq_service, mistral_service, search_service
 
 # Mots-clés simples pour déclencher une recherche web (FR/EN)
@@ -86,9 +90,11 @@ def should_search_web(message: str) -> bool:
 async def maybe_inject_web_context(
     message: str,
     _lang: str,
+    *,
+    force: bool = False,
 ) -> str:
-    """Si besoin, exécute une recherche web et résume brièvement pour le prompt."""
-    if not should_search_web(message):
+    """Si besoin (ou si force), exécute une recherche web et résume pour le prompt."""
+    if not force and not should_search_web(message):
         return message
     try:
         results = await search_service.web_search(message, max_results=4)
@@ -111,10 +117,21 @@ async def build_chat_messages(
     language: Optional[str],
     personality: Optional[str],
     expert_mode: bool,
+    *,
+    force_web_search: bool = False,
+    document_id: Optional[str] = None,
+    create_mode: bool = False,
+    create_type: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, str]]]:
     """Retourne (langue détectée, messages OpenAI pour l'API)."""
     lang = language if language and language != "auto" else detect_language_text(user_message)
-    enriched = await maybe_inject_web_context(user_message, lang)
+    prepared = augment_message_for_create_mode(user_message, create_mode, create_type)
+    if document_id:
+        prepared = (
+            f"{prepared}\n\n"
+            f"[Référence document: {document_id} — l'utilisateur a joint un fichier à analyser.]"
+        )
+    enriched = await maybe_inject_web_context(prepared, lang, force=force_web_search)
     sys_msg = system_prompt_for_lang(lang, personality, expert_mode)
     messages: List[Dict[str, str]] = [{"role": "system", "content": sys_msg}]
     for h in history[-10:]:
@@ -136,13 +153,27 @@ async def _route_llm(
     settings = get_settings()
     sys_msg = messages[0]["content"]
     pref = (model_preference or "auto").lower()
+    groq_ov, mistral_ov, routing_hint, display_label = resolve_sayibi_preference(model_preference)
+    if pref in ("groq", "gemini", "mistral"):
+        routing_hint = pref
 
-    async def try_mistral() -> Tuple[str, Optional[int]]:
-        comp = await mistral_service.chat_completion(messages)
+    def _label(actual: str) -> str:
+        if model_preference and str(model_preference).lower().startswith("sayibi-"):
+            return f"{display_label} ({actual})"
+        return actual
+
+    async def try_mistral(model_name: Optional[str] = None) -> Tuple[str, Optional[int]]:
+        comp = await mistral_service.chat_completion(
+            messages,
+            model=model_name or mistral_service.DEFAULT_MODEL,
+        )
         return mistral_service.extract_text_and_usage(comp)
 
-    async def try_groq() -> Tuple[str, Optional[int]]:
-        comp = await groq_service.chat_completion(messages)
+    async def try_groq(model_name: Optional[str] = None) -> Tuple[str, Optional[int]]:
+        comp = await groq_service.chat_completion(
+            messages,
+            model=model_name or groq_service.DEFAULT_MODEL,
+        )
         return groq_service.extract_text_and_usage(comp)
 
     async def try_gemini_text() -> Tuple[str, Optional[int], str]:
@@ -159,39 +190,56 @@ async def _route_llm(
 
     if need_vision and settings.gemini_api_key:
         text, tok, model_used = await try_gemini_text()
-        return text, model_used, tok
+        return text, _label(model_used), tok
+
+    if routing_hint == "mistral" and settings.mistral_api_key:
+        text, tok = await try_mistral(mistral_ov)
+        used = mistral_ov or mistral_service.DEFAULT_MODEL
+        return text, _label(used), tok
+    if routing_hint == "groq" and settings.groq_api_key:
+        text, tok = await try_groq(groq_ov)
+        used = groq_ov or groq_service.DEFAULT_MODEL
+        return text, _label(used), tok
+    if routing_hint == "gemini" and settings.gemini_api_key:
+        text, tok, model_used = await try_gemini_text()
+        return text, _label(model_used), tok
 
     if pref == "mistral" and settings.mistral_api_key:
-        text, tok = await try_mistral()
-        return text, "mistral-large-latest", tok
+        text, tok = await try_mistral(mistral_ov)
+        used = mistral_ov or mistral_service.DEFAULT_MODEL
+        return text, _label(used), tok
     if pref == "groq" and settings.groq_api_key:
-        text, tok = await try_groq()
-        return text, groq_service.DEFAULT_MODEL, tok
+        text, tok = await try_groq(groq_ov)
+        used = groq_ov or groq_service.DEFAULT_MODEL
+        return text, _label(used), tok
     if pref == "gemini" and settings.gemini_api_key:
         text, tok, model_used = await try_gemini_text()
-        return text, model_used, tok
+        return text, _label(model_used), tok
 
     if lang == "fr" and settings.mistral_api_key:
         try:
-            text, tok = await try_mistral()
-            return text, "mistral-large-latest", tok
+            text, tok = await try_mistral(mistral_ov)
+            used = mistral_ov or mistral_service.DEFAULT_MODEL
+            return text, _label(used), tok
         except Exception:
             pass
 
     if settings.groq_api_key:
         try:
-            text, tok = await try_groq()
-            return text, groq_service.DEFAULT_MODEL, tok
+            text, tok = await try_groq(groq_ov)
+            used = groq_ov or groq_service.DEFAULT_MODEL
+            return text, _label(used), tok
         except Exception:
             pass
 
     if settings.gemini_api_key:
         text, tok, model_used = await try_gemini_text()
-        return text, model_used, tok
+        return text, _label(model_used), tok
 
     if settings.mistral_api_key:
-        text, tok = await try_mistral()
-        return text, "mistral-large-latest", tok
+        text, tok = await try_mistral(mistral_ov)
+        used = mistral_ov or mistral_service.DEFAULT_MODEL
+        return text, _label(used), tok
 
     raise RuntimeError(
         "Aucune clé LLM configurée (GROQ, GEMINI ou MISTRAL).",
@@ -206,6 +254,11 @@ async def run_chat(
     personality: Optional[str] = None,
     expert_mode: bool = False,
     need_vision: bool = False,
+    *,
+    force_web_search: bool = False,
+    document_id: Optional[str] = None,
+    create_mode: bool = False,
+    create_type: Optional[str] = None,
 ) -> Tuple[str, str, Optional[int]]:
     """Retourne (réponse texte, nom du modèle utilisé, tokens estimés)."""
     lang, messages = await build_chat_messages(
@@ -214,6 +267,10 @@ async def run_chat(
         language,
         personality,
         expert_mode,
+        force_web_search=force_web_search,
+        document_id=document_id,
+        create_mode=create_mode,
+        create_type=create_type,
     )
     return await _route_llm(messages, lang, model_preference, need_vision)
 
@@ -225,6 +282,11 @@ async def stream_chat(
     model_preference: Optional[str],
     personality: Optional[str] = None,
     expert_mode: bool = False,
+    *,
+    force_web_search: bool = False,
+    document_id: Optional[str] = None,
+    create_mode: bool = False,
+    create_type: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Flux texte — Groq streaming si dispo et préférence compatible."""
     settings = get_settings()
@@ -234,11 +296,19 @@ async def stream_chat(
         language,
         personality,
         expert_mode,
+        force_web_search=force_web_search,
+        document_id=document_id,
+        create_mode=create_mode,
+        create_type=create_type,
     )
     pref = (model_preference or "auto").lower()
+    groq_ov, _, routing_hint, _ = resolve_sayibi_preference(model_preference)
+    if pref in ("groq", "gemini", "mistral"):
+        routing_hint = pref
 
-    if settings.groq_api_key and pref in ("auto", "groq"):
-        async for chunk in groq_service.chat_completion_stream(messages):
+    stream_model = groq_ov or groq_service.DEFAULT_MODEL
+    if settings.groq_api_key and routing_hint in ("auto", "groq"):
+        async for chunk in groq_service.chat_completion_stream(messages, model=stream_model):
             yield chunk
         return
 

@@ -53,9 +53,16 @@ app.add_middleware(UserContextMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
+# Origines explicites : variable CORS_ORIGINS (Render / .env).
+# Regex en complément : Flutter web en local utilise souvent http://localhost:PORT —
+# inutile de lister chaque port ; évite les erreurs « No Access-Control-Allow-Origin »
+# si l’env distant n’inclut pas exactement le port (8080, 5173, etc.).
+_LOCALHOST_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    allow_origin_regex=_LOCALHOST_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

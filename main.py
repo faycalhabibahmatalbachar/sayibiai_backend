@@ -41,13 +41,8 @@ app = FastAPI(
 
 settings = get_settings()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Ordre : le **dernier** add_middleware est le plus **externe** — CORS en dernier pour que
+# toutes les réponses (y compris 429 du rate limit) reçoivent Access-Control-Allow-Origin.
 if settings.environment == "production":
     app.add_middleware(
         TrustedHostMiddleware,
@@ -57,6 +52,14 @@ if settings.environment == "production":
 app.add_middleware(UserContextMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 API = "/api/v1"
 app.include_router(auth.router, prefix=f"{API}")

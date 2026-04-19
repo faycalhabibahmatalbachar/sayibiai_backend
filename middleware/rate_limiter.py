@@ -35,6 +35,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """Limite globale par utilisateur JWT ou par IP."""
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        # Préflight CORS : ne pas compter / ne pas bloquer avant que CORSMiddleware réponde.
+        if request.method == "OPTIONS":
+            return await call_next(request)
         if request.url.path in ("/health", "/", "/docs", "/openapi.json", "/redoc"):
             return await call_next(request)
         if request.url.path.startswith("/api/v1/internal/"):

@@ -39,7 +39,7 @@ def system_prompt_for_lang(
 ) -> str:
     """Construit le message système multilingue."""
     base_fr = (
-        "Tu es SAYIBI AI, assistant bienveillant et précis pour l'Afrique et le monde francophone. "
+        "Tu es SAYIBI AI, assistant bienveillant et précis pour le Tchad et le monde francophone. "
         "Réponds dans la même langue que l'utilisateur. "
     )
     if expert_mode:

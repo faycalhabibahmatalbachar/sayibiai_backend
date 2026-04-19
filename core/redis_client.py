@@ -28,3 +28,9 @@ async def get_async_redis() -> Optional[redis.Redis]:
     if _redis is None:
         _redis = redis.from_url(url, decode_responses=True)
     return _redis
+
+
+def reset_async_redis() -> None:
+    """Invalide le client partagé (ex. après erreur de connexion) pour forcer une reconnexion."""
+    global _redis
+    _redis = None

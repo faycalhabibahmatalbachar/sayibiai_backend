@@ -1,14 +1,18 @@
 """Limitation de débit par utilisateur via Redis (Upstash compatible)."""
 
+import logging
 import time
 from typing import Callable, Optional
 
+import redis.exceptions as redis_exc
 from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from core.redis_client import get_async_redis
+from core.redis_client import get_async_redis, reset_async_redis
 from core.security import get_subject_from_token
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = 100
 WINDOW_SECONDS = 3600
@@ -21,9 +25,15 @@ async def check_rate_limit(identifier: str, limit: int = DEFAULT_LIMIT) -> None:
         return
     window_bucket = int(time.time()) // WINDOW_SECONDS
     key = f"rl:{identifier}:{window_bucket}"
-    val = await r.incr(key)
-    if val == 1:
-        await r.expire(key, WINDOW_SECONDS + 30)
+    try:
+        val = await r.incr(key)
+        if val == 1:
+            await r.expire(key, WINDOW_SECONDS + 30)
+    except redis_exc.RedisError as exc:
+        # Ne pas faire échouer toute l’API si Redis est down / TLS / idle timeout (Upstash).
+        logger.warning("Rate limit Redis indisponible, requête autorisée: %s", exc)
+        reset_async_redis()
+        return
     if val > limit:
         raise HTTPException(
             status_code=429,

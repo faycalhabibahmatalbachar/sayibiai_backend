@@ -13,6 +13,7 @@ from core.responses import error_response, success_response
 from models.chat import ChatMessageRequest, ChatStreamRequest
 from services import ai_router
 from services import search_service
+from services import session_title_service
 from services.usage_service import log_usage
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -66,6 +67,26 @@ async def _ensure_conversation(session_id: Optional[str], user_id: str, title: s
     return sid
 
 
+async def _maybe_set_ai_session_title(
+    session_id: str,
+    user_msg: str,
+    assistant_text: str,
+    *,
+    is_first_turn: bool,
+) -> None:
+    """Premier échange : titre court généré par IA pour l’historique."""
+    if not is_first_turn:
+        return
+    c = _client()
+    if not c:
+        return
+    try:
+        title = await session_title_service.propose_conversation_title(user_msg, assistant_text)
+        c.table("chat_sessions").update({"title": title[:120]}).eq("id", session_id).execute()
+    except Exception:
+        pass
+
+
 async def _save_message(
     session_id: str,
     role: str,
@@ -114,6 +135,12 @@ async def post_message(body: ChatMessageRequest, user_id: str = Depends(get_curr
         return error_response(str(e), 500)
     await _save_message(session_id, "user", body.message, None)
     await _save_message(session_id, "assistant", reply, tokens)
+    await _maybe_set_ai_session_title(
+        session_id,
+        body.message,
+        reply,
+        is_first_turn=not bool(history),
+    )
     await log_usage(user_id, "/chat/message", tokens, model_used)
     payload = {
         "response": reply,
@@ -169,6 +196,12 @@ async def post_stream(body: ChatStreamRequest, user_id: str = Depends(get_curren
             text = "".join(full)
             await _save_message(session_id, "user", body.message, None)
             await _save_message(session_id, "assistant", text, None)
+            await _maybe_set_ai_session_title(
+                session_id,
+                body.message,
+                text,
+                is_first_turn=not bool(history),
+            )
             done_payload = {"done": True, "session_id": session_id, "metadata": meta_acc}
             yield f"data: {json.dumps(done_payload)}\n\n"
         except Exception as e:

@@ -7,7 +7,6 @@ from langdetect import detect
 
 from core.config import get_settings
 from core.models_config import (
-    SayibiModel,
     augment_message_for_create_mode,
     resolve_sayibi_preference,
 )
@@ -17,6 +16,7 @@ from services import (
     gemini_service,
     groq_service,
     image_gen_service,
+    image_intent,
     mistral_service,
     search_service,
 )
@@ -64,6 +64,9 @@ def system_prompt_for_lang(
     base_fr = (
         "Tu es SAYIBI AI, assistant bienveillant et précis pour le Tchad et le monde francophone. "
         "Réponds dans la même langue que l'utilisateur. "
+        "Des images peuvent être produites par un moteur dédié et les SMS peuvent être envoyés depuis "
+        "le téléphone via un outil système : ne prétends pas que tu ne peux pas le faire lorsque "
+        "l’application exécute ces actions. Reste utile et concis, sans cours théorique inutile. "
     )
     if expert_mode:
         base_fr += "Mode expert : détails techniques et nuances autorisés. "
@@ -79,6 +82,8 @@ def system_prompt_for_lang(
     if lang == "en":
         return (
             "You are SAYIBI AI, a helpful multilingual assistant. Answer clearly in English. "
+            "The app may generate images or send SMS via on-device tools — do not claim you cannot "
+            "when the app handles these. Be concise, avoid unnecessary theory. "
             + (f"Persona: {personality}. " if personality else "")
         )
     return base_fr
@@ -269,6 +274,24 @@ async def _route_llm(
     )
 
 
+async def _yield_image_tool_stream(
+    user_message: str,
+    user_id: str,
+    meta: Dict[str, Any],
+) -> AsyncIterator[str]:
+    """Outil génération d’image (Gemini) — utilisé en mode Images ou Auto + intention."""
+    prompt = image_gen_service.finalize_prompt_for_image_generation(user_message)
+    for ch in "✨ Génération de l’image…\n\n":
+        yield ch
+    text, urls = await image_gen_service.generate_image_and_upload(
+        prompt,
+        user_id or "anon",
+    )
+    meta["image_urls"] = urls
+    for ch in text:
+        yield ch
+
+
 async def run_chat(
     user_message: str,
     history: List[Dict[str, str]],
@@ -290,10 +313,16 @@ async def run_chat(
     """
     meta: Dict[str, Any] = {}
     pref = (model_preference or "auto").strip().lower()
+    doc_flow = bool(create_mode and create_type)
 
-    if pref == SayibiModel.IMAGES.value:
+    if image_intent.should_use_image_generation_tool(
+        pref,
+        user_message,
+        document_creation_flow=doc_flow,
+    ):
+        prompt = image_gen_service.finalize_prompt_for_image_generation(user_message)
         text, urls = await image_gen_service.generate_image_and_upload(
-            user_message,
+            prompt,
             user_id or "anon",
         )
         meta["image_urls"] = urls
@@ -362,17 +391,15 @@ async def stream_chat(
     settings = get_settings()
     meta = metadata_out if metadata_out is not None else {}
     pref = (model_preference or "auto").strip().lower()
+    doc_flow = bool(create_mode and create_type)
 
-    if pref == SayibiModel.IMAGES.value:
-        for ch in "✨ Génération de l'image avec le moteur SAYIBI…\n\n":
-            yield ch
-        text, urls = await image_gen_service.generate_image_and_upload(
-            user_message,
-            user_id or "anon",
-        )
-        meta["image_urls"] = urls
-        for ch in text:
-            yield ch
+    if image_intent.should_use_image_generation_tool(
+        pref,
+        user_message,
+        document_creation_flow=doc_flow,
+    ):
+        async for chunk in _yield_image_tool_stream(user_message, user_id, meta):
+            yield chunk
         return
 
     if create_mode and create_type:

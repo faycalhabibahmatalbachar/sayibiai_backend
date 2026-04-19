@@ -1,4 +1,4 @@
-"""Génération d'images réelle — Gemini (modalités IMAGE) puis repli OpenAI DALL·E."""
+"""Génération d'images réelle — Gemini (modalités IMAGE) uniquement (pas de DALL·E payant)."""
 
 import base64
 import logging
@@ -11,6 +11,26 @@ from core.config import get_settings
 from services import storage_service
 
 logger = logging.getLogger(__name__)
+
+
+def finalize_prompt_for_image_generation(user_message: str) -> str:
+    """
+    Enrichit la demande : résultat fiable + impact visuel même si l’utilisateur est peu descriptif.
+    Pas de « cours théorique » dans l’image — uniquement le rendu.
+    """
+    base = (user_message or "").strip()
+    if len(base) < 3:
+        base = (
+            "Composition visuelle forte, sujet central clair, esthétique soignée, "
+            "forte lisibilité ; peut être minimaliste ou monochrome si pertinent."
+        )
+    rules = (
+        "\n\n[Consignes de rendu : image fidèle au sujet, cohérente, sans artefacts absurdes. "
+        "Si la demande est vague : privilégier une composition équilibrée, esthétique marquée, "
+        "éventuellement noir et blanc ou palette sobre. Éviter tout pavé de texte dans l’image "
+        "sauf si explicitement demandé.]"
+    )
+    return base + rules
 
 # Modèles testés côté Google AI Studio (génération native).
 _GEMINI_IMAGE_MODELS = (
@@ -69,40 +89,6 @@ async def _try_gemini_native_image(prompt: str) -> Tuple[Optional[bytes], Option
     return None, None
 
 
-async def _try_openai_dalle(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
-    settings = get_settings()
-    key = (settings.openai_api_key or "").strip()
-    if not key:
-        return None, None
-    try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/images/generations",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "dall-e-3",
-                    "prompt": prompt[:3900],
-                    "n": 1,
-                    "size": "1024x1024",
-                    "quality": "standard",
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            url = (data.get("data") or [{}])[0].get("url")
-            if not url:
-                return None, None
-            gr = await client.get(url)
-            gr.raise_for_status()
-            return gr.content, "image/png"
-    except Exception as e:
-        logger.warning("OpenAI image: %s", e)
-        return None, None
-
-
 async def generate_image_and_upload(
     prompt: str,
     user_id: str,
@@ -115,13 +101,11 @@ async def generate_image_and_upload(
     mime = "image/png"
 
     raw, mime = await _try_gemini_native_image(prompt)
-    if not raw:
-        raw, mime = await _try_openai_dalle(prompt)
 
     if not raw:
         raise RuntimeError(
-            "Aucun moteur d'images disponible : configurez GEMINI_API_KEY (génération native) "
-            "et/ou OPENAI_API_KEY (DALL·E 3).",
+            "Génération d’image indisponible : configurez GEMINI_API_KEY avec un modèle "
+            "supportant la sortie image (Google AI Studio / Gemini).",
         )
 
     ext = "png" if "png" in mime else "jpg"
@@ -133,9 +117,6 @@ async def generate_image_and_upload(
         fname,
         ct,
     )
-    caption = (
-        "Voici l'image générée. Vous pouvez la télécharger via le lien ci-dessous.\n\n"
-        f"![]({url})"
-    )
+    caption = f"![]({url})"
     return caption, [url]
 

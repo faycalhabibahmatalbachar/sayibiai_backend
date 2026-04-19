@@ -12,6 +12,7 @@ from core.database import get_supabase_admin
 from core.responses import error_response, success_response
 from models.chat import ChatMessageRequest, ChatStreamRequest
 from services import ai_router
+from services import search_service
 from services.usage_service import log_usage
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -95,7 +96,7 @@ async def post_message(body: ChatMessageRequest, user_id: str = Depends(get_curr
     session_id = await _ensure_conversation(body.session_id, user_id, title)
     hist = [{"role": m["role"], "content": m["content"]} for m in history]
     try:
-        reply, model_used, tokens = await ai_router.run_chat(
+        reply, model_used, tokens, extra = await ai_router.run_chat(
             body.message,
             hist,
             body.language,
@@ -107,21 +108,22 @@ async def post_message(body: ChatMessageRequest, user_id: str = Depends(get_curr
             document_id=body.document_id,
             create_mode=bool(body.create_mode),
             create_type=body.create_type,
+            user_id=user_id,
         )
     except Exception as e:
         return error_response(str(e), 500)
     await _save_message(session_id, "user", body.message, None)
     await _save_message(session_id, "assistant", reply, tokens)
     await log_usage(user_id, "/chat/message", tokens, model_used)
-    return success_response(
-        {
-            "response": reply,
-            "model_used": model_used,
-            "tokens": tokens,
-            "session_id": session_id,
-        },
-        "OK",
-    )
+    payload = {
+        "response": reply,
+        "model_used": model_used,
+        "tokens": tokens,
+        "session_id": session_id,
+    }
+    if extra:
+        payload["metadata"] = extra
+    return success_response(payload, "OK")
 
 
 @router.post("/stream")
@@ -134,7 +136,20 @@ async def post_stream(body: ChatStreamRequest, user_id: str = Depends(get_curren
         session_id = await _ensure_conversation(body.session_id, user_id, title)
         hist = [{"role": m["role"], "content": m["content"]} for m in history]
         full: List[str] = []
+        meta_acc: dict = {}
         try:
+            if body.web_search:
+                try:
+                    meta_acc["sources"] = await search_service.web_search(body.message, max_results=6)
+                    meta_acc["search_images"] = await search_service.web_image_search(
+                        body.message,
+                        max_results=8,
+                    )
+                except Exception:
+                    meta_acc.setdefault("sources", [])
+                    meta_acc.setdefault("search_images", [])
+                yield f"data: {json.dumps({'metadata': meta_acc})}\n\n"
+
             async for chunk in ai_router.stream_chat(
                 body.message,
                 hist,
@@ -146,13 +161,16 @@ async def post_stream(body: ChatStreamRequest, user_id: str = Depends(get_curren
                 document_id=body.document_id,
                 create_mode=bool(body.create_mode),
                 create_type=body.create_type,
+                user_id=user_id,
+                metadata_out=meta_acc,
             ):
                 full.append(chunk)
                 yield f"data: {json.dumps({'chunk': chunk})}\n\n"
             text = "".join(full)
             await _save_message(session_id, "user", body.message, None)
             await _save_message(session_id, "assistant", text, None)
-            yield f"data: {json.dumps({'done': True, 'session_id': session_id})}\n\n"
+            done_payload = {"done": True, "session_id": session_id, "metadata": meta_acc}
+            yield f"data: {json.dumps(done_payload)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 

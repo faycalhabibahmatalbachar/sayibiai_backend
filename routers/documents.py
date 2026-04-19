@@ -118,7 +118,7 @@ async def ask_document(body: DocumentAskRequest, user_id: str = Depends(get_curr
         "Réponds en t'appuyant sur le contexte. Si tu ne sais pas, dis-le."
     )
     try:
-        answer, model, tok = await ai_router.run_chat(prompt, [], "auto", "auto", None, False, False)
+        answer, model, tok, _ = await ai_router.run_chat(prompt, [], "auto", "auto", None, False, False)
     except Exception as e:
         return error_response(str(e), 500)
     await log_usage(user_id, "/documents/ask", tok, model)
@@ -163,7 +163,7 @@ async def summarize_document(
     }.get(fmt, "Résume en puces.")
     prompt = f"{instructions}\n\nDocument :\n{text[:20000]}"
     try:
-        summary, model, tok = await ai_router.run_chat(prompt, [], "auto", "auto", None, False, False)
+        summary, model, tok, _ = await ai_router.run_chat(prompt, [], "auto", "auto", None, False, False)
     except Exception as e:
         return error_response(str(e), 500)
     await log_usage(user_id, "/documents/summarize", tok, model)

@@ -57,18 +57,15 @@ async def search_answer(body: AnswerBody, user_id: str = Depends(get_current_use
     except Exception as e:
         return error_response(str(e), 502)
     ctx_lines: List[str] = []
-    sources: List[str] = []
     for r in results:
         ctx_lines.append(f"- {r.get('title')}: {r.get('snippet')}")
-        if r.get("url"):
-            sources.append(r["url"])
     prompt = (
         f"Question : {body.question}\n\nContexte :\n"
         + "\n".join(ctx_lines)
         + "\n\nRéponds de façon concise en citant implicitement les sources."
     )
     try:
-        answer, model, tok = await ai_router.run_chat(
+        answer, model, tok, _ = await ai_router.run_chat(
             prompt,
             [],
             "fr",
@@ -80,4 +77,10 @@ async def search_answer(body: AnswerBody, user_id: str = Depends(get_current_use
     except Exception as e:
         return error_response(str(e), 500)
     await log_usage(user_id, "/search/answer", tok, model)
-    return success_response({"answer": answer, "sources": sources}, "OK")
+    return success_response(
+        {
+            "answer": answer,
+            "sources": results,
+        },
+        "OK",
+    )

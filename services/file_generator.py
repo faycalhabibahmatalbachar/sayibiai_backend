@@ -2,7 +2,7 @@
 
 import io
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
 from docx.shared import Pt
@@ -115,6 +115,32 @@ def build_excel_workbook(
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
+    return buf.getvalue()
+
+
+def build_presentation_pptx(
+    main_title: str,
+    slides: List[Tuple[str, List[str]]],
+) -> bytes:
+    """Présentation PowerPoint simple : titre + puces par diapo."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    s0 = prs.slides.add_slide(prs.slide_layouts[0])
+    s0.shapes.title.text = main_title[:200]
+    for slide_title, bullets in slides:
+        s = prs.slides.add_slide(prs.slide_layouts[1])
+        s.shapes.title.text = slide_title[:200]
+        body = s.shapes.placeholders[1].text_frame
+        if bullets:
+            body.text = str(bullets[0])[:500]
+            for line in bullets[1:12]:
+                p = body.add_paragraph()
+                p.text = str(line)[:500]
+        else:
+            body.text = ""
+    buf = io.BytesIO()
+    prs.save(buf)
     return buf.getvalue()
 
 

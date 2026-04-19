@@ -64,6 +64,10 @@ class Settings(BaseSettings):
         ),
     )
     mistral_api_key: str = ""
+    openai_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"),
+    )
     elevenlabs_api_key: str = ""
     tavily_api_key: str = ""
     serper_api_key: str = Field(

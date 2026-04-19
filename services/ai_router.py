@@ -1,16 +1,25 @@
 """Routage intelligent entre LLM + injection recherche web + historique."""
 
 import re
-from typing import AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from langdetect import detect
 
 from core.config import get_settings
 from core.models_config import (
+    SayibiModel,
     augment_message_for_create_mode,
     resolve_sayibi_preference,
 )
-from services import gemini_service, groq_service, mistral_service, search_service
+from services import (
+    chat_creation_service,
+    device_intent,
+    gemini_service,
+    groq_service,
+    image_gen_service,
+    mistral_service,
+    search_service,
+)
 
 # Mots-clés simples pour déclencher une recherche web (FR/EN)
 WEB_HINT_PATTERNS = re.compile(
@@ -34,6 +43,16 @@ def detect_language_text(text: str) -> str:
     if code.startswith("fr"):
         return "fr"
     return "en"
+
+
+def _sms_system_addon(destination_e164: str) -> str:
+    return (
+        "\n\n[Mode SMS — l’utilisateur enverra ce texte depuis SON téléphone (carte SIM), "
+        "sans passerelle payante. "
+        f"Destinataire (ne pas recopier le numéro dans le corps du message) : {destination_e164}. "
+        "Réponds par le SEUL texte du SMS, sans introduction ni guillemets, sans markdown. "
+        "Message court et naturel.]"
+    )
 
 
 def system_prompt_for_lang(
@@ -122,6 +141,8 @@ async def build_chat_messages(
     document_id: Optional[str] = None,
     create_mode: bool = False,
     create_type: Optional[str] = None,
+    model_preference: Optional[str] = None,
+    sms_destination_e164: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, str]]]:
     """Retourne (langue détectée, messages OpenAI pour l'API)."""
     lang = language if language and language != "auto" else detect_language_text(user_message)
@@ -133,6 +154,8 @@ async def build_chat_messages(
         )
     enriched = await maybe_inject_web_context(prepared, lang, force=force_web_search)
     sys_msg = system_prompt_for_lang(lang, personality, expert_mode)
+    if sms_destination_e164:
+        sys_msg += _sms_system_addon(sms_destination_e164)
     messages: List[Dict[str, str]] = [{"role": "system", "content": sys_msg}]
     for h in history[-10:]:
         role = h.get("role", "user")
@@ -259,8 +282,44 @@ async def run_chat(
     document_id: Optional[str] = None,
     create_mode: bool = False,
     create_type: Optional[str] = None,
-) -> Tuple[str, str, Optional[int]]:
-    """Retourne (réponse texte, nom du modèle utilisé, tokens estimés)."""
+    user_id: str = "",
+) -> Tuple[str, str, Optional[int], Dict[str, Any]]:
+    """
+    Retourne (réponse texte, nom du modèle utilisé, tokens estimés, métadonnées).
+    Métadonnées : image_urls, sources (web), generated_file, etc.
+    """
+    meta: Dict[str, Any] = {}
+    pref = (model_preference or "auto").strip().lower()
+
+    if pref == SayibiModel.IMAGES.value:
+        text, urls = await image_gen_service.generate_image_and_upload(
+            user_message,
+            user_id or "anon",
+        )
+        meta["image_urls"] = urls
+        return text, "Sayibi Images", None, meta
+
+    if create_mode and create_type:
+        text, model, tok, cmeta = await chat_creation_service.create_from_chat(
+            user_message,
+            create_type,
+            user_id or "anon",
+        )
+        meta.update(cmeta)
+        return text, model, tok, meta
+
+    sms = device_intent.parse_send_sms_intent(user_message)
+
+    if force_web_search:
+        try:
+            meta["sources"] = await search_service.web_search(user_message, max_results=6)
+        except Exception:
+            meta["sources"] = []
+        try:
+            meta["search_images"] = await search_service.web_image_search(user_message, max_results=8)
+        except Exception:
+            meta["search_images"] = []
+
     lang, messages = await build_chat_messages(
         user_message,
         history,
@@ -269,10 +328,19 @@ async def run_chat(
         expert_mode,
         force_web_search=force_web_search,
         document_id=document_id,
-        create_mode=create_mode,
-        create_type=create_type,
+        create_mode=False,
+        create_type=None,
+        model_preference=model_preference,
+        sms_destination_e164=sms.to_e164 if sms else None,
     )
-    return await _route_llm(messages, lang, model_preference, need_vision)
+    text, model_used, tokens = await _route_llm(messages, lang, model_preference, need_vision)
+    if sms:
+        meta["device_action"] = {
+            "type": "send_sms",
+            "to": sms.to_e164,
+            "body": text.strip(),
+        }
+    return text, model_used, tokens, meta
 
 
 async def stream_chat(
@@ -287,9 +355,53 @@ async def stream_chat(
     document_id: Optional[str] = None,
     create_mode: bool = False,
     create_type: Optional[str] = None,
+    user_id: str = "",
+    metadata_out: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[str]:
-    """Flux texte — Groq streaming si dispo et préférence compatible."""
+    """Flux texte — Groq streaming seulement si routage groq/auto ; sinon génération réelle ou fallback."""
     settings = get_settings()
+    meta = metadata_out if metadata_out is not None else {}
+    pref = (model_preference or "auto").strip().lower()
+
+    if pref == SayibiModel.IMAGES.value:
+        for ch in "✨ Génération de l'image avec le moteur SAYIBI…\n\n":
+            yield ch
+        text, urls = await image_gen_service.generate_image_and_upload(
+            user_message,
+            user_id or "anon",
+        )
+        meta["image_urls"] = urls
+        for ch in text:
+            yield ch
+        return
+
+    if create_mode and create_type:
+        for ch in "📄 Génération du document (fichier réel)…\n\n":
+            yield ch
+        text, _, _, cmeta = await chat_creation_service.create_from_chat(
+            user_message,
+            create_type,
+            user_id or "anon",
+        )
+        meta.update(cmeta)
+        for ch in text:
+            yield ch
+        return
+
+    sms = device_intent.parse_send_sms_intent(user_message)
+
+    if force_web_search:
+        if "sources" not in meta:
+            try:
+                meta["sources"] = await search_service.web_search(user_message, max_results=6)
+            except Exception:
+                meta["sources"] = []
+        if "search_images" not in meta:
+            try:
+                meta["search_images"] = await search_service.web_image_search(user_message, max_results=8)
+            except Exception:
+                meta["search_images"] = []
+
     lang, messages = await build_chat_messages(
         user_message,
         history,
@@ -298,20 +410,36 @@ async def stream_chat(
         expert_mode,
         force_web_search=force_web_search,
         document_id=document_id,
-        create_mode=create_mode,
-        create_type=create_type,
+        create_mode=False,
+        create_type=None,
+        model_preference=model_preference,
+        sms_destination_e164=sms.to_e164 if sms else None,
     )
-    pref = (model_preference or "auto").lower()
     groq_ov, _, routing_hint, _ = resolve_sayibi_preference(model_preference)
-    if pref in ("groq", "gemini", "mistral"):
-        routing_hint = pref
+    p2 = (model_preference or "auto").lower()
+    if p2 in ("groq", "gemini", "mistral"):
+        routing_hint = p2
 
     stream_model = groq_ov or groq_service.DEFAULT_MODEL
     if settings.groq_api_key and routing_hint in ("auto", "groq"):
+        acc: List[str] = []
         async for chunk in groq_service.chat_completion_stream(messages, model=stream_model):
+            acc.append(chunk)
             yield chunk
+        if sms:
+            meta["device_action"] = {
+                "type": "send_sms",
+                "to": sms.to_e164,
+                "body": "".join(acc).strip(),
+            }
         return
 
     text, _, _ = await _route_llm(messages, lang, model_preference, False)
     for ch in text:
         yield ch
+    if sms:
+        meta["device_action"] = {
+            "type": "send_sms",
+            "to": sms.to_e164,
+            "body": text.strip(),
+        }

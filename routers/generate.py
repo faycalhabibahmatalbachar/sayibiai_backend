@@ -24,7 +24,7 @@ router = APIRouter(prefix="/generate", tags=["generate"])
 
 async def _llm_json(prompt: str):
     """Demande une sortie structurée au LLM ; retourne (texte, tokens)."""
-    out, _model, tok = await ai_router.run_chat(
+    out, _model, tok, _extra = await ai_router.run_chat(
         prompt + "\nRéponds uniquement avec le contenu demandé, sans préambule.",
         [],
         "auto",

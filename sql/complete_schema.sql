@@ -21,8 +21,10 @@ CREATE TABLE IF NOT EXISTS public.users (
   avatar_url TEXT,
   language TEXT DEFAULT 'fr' CHECK (language IN ('fr', 'ar', 'en')),
   plan TEXT DEFAULT 'free' CHECK (plan IN ('free', 'pro', 'enterprise')),
-  model_preference TEXT DEFAULT 'auto' CHECK (model_preference IN ('auto', 'groq', 'gemini', 'mistral')),
+  -- Valeurs libres : auto, groq, gemini, mistral, sayibi-*, etc.
+  model_preference TEXT DEFAULT 'auto',
   theme TEXT DEFAULT 'dark' CHECK (theme IN ('light', 'dark')),
+  notifications BOOLEAN DEFAULT true,
   fcm_token TEXT, -- Firebase Cloud Messaging token
   total_tokens_used BIGINT DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW(),

@@ -28,6 +28,7 @@ PyMuPDF==1.26.7
 python-docx==1.1.0
 reportlab==4.0.9
 openpyxl==3.1.2
+python-pptx==0.6.23
 Pillow==10.4.0
 
 # Vecteurs (paquet officiel renommé : pinecone, plus pinecone-client)

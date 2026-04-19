@@ -114,6 +114,19 @@ async def put_settings(body: UserSettingsBody, user_id: str = Depends(get_curren
         c.table("users").update(data).eq("id", user_id).execute()
         return success_response(data, "Réglages enregistrés")
     except Exception as e:
+        msg = str(e).lower()
+        if "notifications" in msg and ("column" in msg or "does not exist" in msg):
+            return error_response(
+                "Colonne « notifications » absente en base — exécutez "
+                "sayibi_backend/sql/migrations/001_user_settings_fix.sql sur Supabase.",
+                500,
+            )
+        if "model_preference" in msg and ("check" in msg or "violates" in msg):
+            return error_response(
+                "Contrainte model_preference trop stricite — exécutez "
+                "sayibi_backend/sql/migrations/001_user_settings_fix.sql sur Supabase.",
+                500,
+            )
         return error_response(str(e), 500)
 
 

@@ -60,9 +60,9 @@ services:
         sync: false
       - key: SAYIBI_INTERNAL_SECRET
         sync: false
-      # Sans nom de domaine : localhost pour dev web / Flutter web ; ajoutez votre domaine plus tard.
+      # Origines navigateur (Flutter web / SPA). Ajoutez un port si Chrome utilise autre chose (voir message CORS).
       - key: CORS_ORIGINS
-        value: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080"
+        value: "https://sayibi.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost:8081,http://127.0.0.1:8081,http://localhost:8082,http://127.0.0.1:8082,http://localhost:5000,http://127.0.0.1:5000,http://localhost:4200,http://127.0.0.1:4200"
       # Toujours définir : sinon le health check Render échoue (400 Invalid host) si le hostname n’est pas listé.
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"

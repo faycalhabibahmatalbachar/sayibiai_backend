@@ -1,5 +1,6 @@
 """Authentification — Supabase + JWT applicatif + refresh Redis."""
 
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any, Dict, Optional
@@ -15,6 +16,8 @@ from core.security import create_access_token, create_refresh_token_value
 from models.auth import GoogleAuthRequest, LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+logger = logging.getLogger(__name__)
 
 _refresh_memory: Dict[str, str] = {}
 
@@ -64,11 +67,17 @@ async def register(body: RegisterRequest, request: Request):
     if not client:
         return error_response("Supabase non configuré", 503)
     try:
+        display = (body.name or "").strip()
         res = client.auth.sign_up(
             {
                 "email": body.email,
                 "password": body.password,
-                "options": {"data": {"name": body.name or ""}},
+                "options": {
+                    "data": {
+                        "full_name": display,
+                        "name": display,
+                    },
+                },
             },
         )
     except Exception as e:
@@ -79,19 +88,26 @@ async def register(body: RegisterRequest, request: Request):
             None,
             "Compte créé — confirmez votre email si requis par le projet Supabase",
         )
-    uid = str(user.id)
-    email = user.email or body.email
-    payload = _tokens_payload(uid, email)
-    await _store_refresh(payload["refresh_token"], uid)
-    admin = get_supabase_admin()
-    if admin and body.name:
+    try:
+        uid = str(user.id)
+        email = user.email or body.email
+        payload = _tokens_payload(uid, email)
         try:
-            admin.table("users").upsert(
-                {"id": uid, "email": email, "name": body.name},
-            ).execute()
-        except Exception:
-            pass
-    return success_response(payload, "Inscription réussie")
+            await _store_refresh(payload["refresh_token"], uid)
+        except Exception as exc:
+            logger.warning("Refresh token non stocké (Redis ou mémoire): %s", exc)
+        admin = get_supabase_admin()
+        if admin:
+            try:
+                admin.table("users").upsert(
+                    {"id": uid, "email": email, "full_name": display},
+                ).execute()
+            except Exception as exc:
+                logger.debug("Upsert profil users ignoré: %s", exc)
+        return success_response(payload, "Inscription réussie")
+    except Exception as e:
+        logger.exception("register: échec après sign_up Supabase")
+        return error_response("Erreur serveur lors de l'inscription", 500)
 
 
 @router.post("/login")

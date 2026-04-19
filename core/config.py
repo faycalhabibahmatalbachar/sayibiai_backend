@@ -164,7 +164,8 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     debug: bool = False
     trusted_hosts: str = Field(
-        default="sayibi-backend.onrender.com,api.sayibi.app,localhost,127.0.0.1",
+        # *.onrender.com : accepte tout sous-domaine Render (ex. sayibi-backend-xxxx.onrender.com).
+        default="*.onrender.com,sayibi-backend.onrender.com,api.sayibi.app,localhost,127.0.0.1",
         validation_alias=AliasChoices("TRUSTED_HOSTS", "trusted_hosts"),
     )
 

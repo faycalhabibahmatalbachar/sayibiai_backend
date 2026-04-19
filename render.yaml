@@ -15,7 +15,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.11.9"
       - key: ENVIRONMENT
         value: production
       - key: LOG_LEVEL
@@ -60,5 +60,9 @@ services:
         sync: false
       - key: SAYIBI_INTERNAL_SECRET
         sync: false
+      # Sans nom de domaine : localhost pour dev web / Flutter web ; ajoutez votre domaine plus tard.
       - key: CORS_ORIGINS
-        sync: false
+        value: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080"
+      # Toujours définir : sinon le health check Render échoue (400 Invalid host) si le hostname n’est pas listé.
+      - key: TRUSTED_HOSTS
+        value: "*.onrender.com,localhost,127.0.0.1"

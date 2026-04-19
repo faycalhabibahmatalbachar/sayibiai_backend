@@ -25,17 +25,21 @@ async def chat_completion(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
     max_tokens: int = 4096,
+    *,
+    json_mode: bool = False,
 ) -> Dict[str, Any]:
-    """Appel chat non-streaming."""
+    """Appel chat non-streaming. Si json_mode=True, force une réponse JSON objet (modèles compatibles)."""
     settings = get_settings()
     if not settings.groq_api_key:
         raise RuntimeError("GROQ_API_KEY manquant")
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(GROQ_CHAT_URL, headers=_headers(), json=payload)
         r.raise_for_status()

@@ -15,7 +15,7 @@ from middleware.logger import RequestLoggingMiddleware, setup_logging
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.user_context import UserContextMiddleware
 from services import fcm_service
-from routers import auth, chat, documents, generate, internal, search, user, voice
+from routers import agent, auth, chat, documents, generate, internal, search, user, voice
 
 
 @asynccontextmanager
@@ -70,6 +70,7 @@ app.add_middleware(
 
 API = "/api/v1"
 app.include_router(auth.router, prefix=f"{API}")
+app.include_router(agent.router, prefix=f"{API}")
 app.include_router(chat.router, prefix=f"{API}")
 app.include_router(voice.router, prefix=f"{API}")
 app.include_router(documents.router, prefix=f"{API}")

@@ -53,6 +53,17 @@ def _store_generated_file(
         return None
 
 
+def _build_download_meta(file_id: str, storage_path: str) -> dict:
+    signed = storage_service.get_presigned_url(storage_path, expires_in=60 * 60 * 24)
+    meta = {
+        "file_id": file_id,
+        "download_url": f"/api/v1/generate/download/{file_id}",
+    }
+    if signed:
+        meta["download_url_signed"] = signed
+    return meta
+
+
 async def _llm_json(prompt: str):
     """Demande une sortie structurée au LLM ; retourne (texte, tokens)."""
     out, _model, tok, _extra = await ai_router.run_chat(
@@ -90,8 +101,7 @@ async def generate_cv(body: GenerateCVRequest, user_id: str = Depends(get_curren
         prompt_used=json.dumps(p),
     )
     if fid:
-        meta["file_id"] = fid
-        meta["download_url"] = f"/api/v1/generate/download/{fid}"
+        meta.update(_build_download_meta(fid, meta["object_key"]))
     await log_usage(user_id, "/generate/cv", None, "generate")
     return success_response(meta, "CV généré")
 
@@ -120,8 +130,7 @@ async def generate_letter(body: GenerateLetterRequest, user_id: str = Depends(ge
         prompt_used=prompt,
     )
     if fid:
-        meta["file_id"] = fid
-        meta["download_url"] = f"/api/v1/generate/download/{fid}"
+        meta.update(_build_download_meta(fid, meta["object_key"]))
     await log_usage(user_id, "/generate/letter", tok, "llm")
     return success_response(meta, "Lettre générée")
 
@@ -145,8 +154,7 @@ async def generate_report(body: GenerateReportRequest, user_id: str = Depends(ge
         prompt_used=prompt,
     )
     if fid:
-        meta["file_id"] = fid
-        meta["download_url"] = f"/api/v1/generate/download/{fid}"
+        meta.update(_build_download_meta(fid, meta["object_key"]))
     await log_usage(user_id, "/generate/report", tok, "llm")
     return success_response(meta, "Rapport généré")
 
@@ -187,8 +195,7 @@ async def generate_excel(body: GenerateExcelRequest, user_id: str = Depends(get_
         prompt_used=prompt,
     )
     if fid:
-        meta["file_id"] = fid
-        meta["download_url"] = f"/api/v1/generate/download/{fid}"
+        meta.update(_build_download_meta(fid, meta["object_key"]))
     await log_usage(user_id, "/generate/excel", tok, "llm")
     return success_response(meta, "Excel généré")
 
@@ -243,8 +250,7 @@ async def generate_from_chat(body: GenerateFromChatRequest, user_id: str = Depen
         session_id=body.session_id,
     )
     if fid:
-        meta["file_id"] = fid
-        meta["download_url"] = f"/api/v1/generate/download/{fid}"
+        meta.update(_build_download_meta(fid, meta["object_key"]))
     await log_usage(user_id, "/generate/from_chat", tok, "llm")
     return success_response(meta, "Document créé depuis le chat")
 

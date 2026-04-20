@@ -38,11 +38,15 @@ def _safe_upstream_error_message(exc: httpx.HTTPStatusError) -> str:
 
 @router.post("/transcribe")
 async def transcribe(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    audio: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Audio → texte (Groq Whisper). Formats : webm, mp3, wav, m4a."""
-    raw = await file.read()
+    source = file or audio
+    if source is None:
+        return error_response("Champ audio manquant (file)", 422)
+    raw = await source.read()
     if not raw:
         return error_response("Fichier audio vide", 400)
     if len(raw) > 25 * 1024 * 1024:
@@ -50,8 +54,8 @@ async def transcribe(
     try:
         data = await groq_service.transcribe_audio(
             raw,
-            file.filename or "audio.webm",
-            file.content_type,
+            source.filename or "audio.webm",
+            source.content_type,
         )
     except httpx.HTTPStatusError as e:
         status = e.response.status_code

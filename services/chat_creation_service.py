@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.database import get_supabase_admin
 from core.config import get_settings
-from services import file_generator, groq_service, mistral_service
+from services import file_generator, groq_service, mistral_service, storage_service
 
 
 def _extract_json_object(raw: str) -> Optional[dict]:
@@ -20,6 +20,17 @@ def _extract_json_object(raw: str) -> Optional[dict]:
         return json.loads(raw[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _build_download_meta(file_id: str, object_key: str) -> Dict[str, Any]:
+    signed = storage_service.get_presigned_url(object_key, expires_in=60 * 60 * 24)
+    out: Dict[str, Any] = {
+        "file_id": file_id,
+        "download_url": f"/api/v1/generate/download/{file_id}",
+    }
+    if signed:
+        out["download_url_signed"] = signed
+    return out
 
 
 async def _llm(system: str, user: str) -> Tuple[str, Optional[int], str]:
@@ -113,8 +124,7 @@ async def create_from_chat(
         }
         fid = _store_generated("cv", fname, up["object_key"])
         if fid:
-            meta["generated_file"]["file_id"] = fid
-            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
+            meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = (
             f"**CV généré** — téléchargement : [{fname}]({up['url']})\n\n"
             "Vous pouvez ouvrir le fichier Word et ajuster la mise en forme."
@@ -135,8 +145,7 @@ async def create_from_chat(
         meta["generated_file"] = {"type": "letter", "filename": fname, "url": up["url"]}
         fid = _store_generated("letter", fname, up["object_key"])
         if fid:
-            meta["generated_file"]["file_id"] = fid
-            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
+            meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = f"**Lettre générée** — [{fname}]({up['url']})"
         return text, f"Sayibi Création ({model})", tok, meta
 
@@ -157,8 +166,7 @@ async def create_from_chat(
         meta["generated_file"] = {"type": "report", "filename": fname, "url": up["url"]}
         fid = _store_generated("report", fname, up["object_key"])
         if fid:
-            meta["generated_file"]["file_id"] = fid
-            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
+            meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = f"**Rapport PDF généré** — [{fname}]({up['url']})\n\n{body[:800]}{'…' if len(body) > 800 else ''}"
         return text, f"Sayibi Création ({model})", tok, meta
 
@@ -188,8 +196,7 @@ async def create_from_chat(
         meta["generated_file"] = {"type": "excel", "filename": fname, "url": up["url"]}
         fid = _store_generated("excel", fname, up["object_key"])
         if fid:
-            meta["generated_file"]["file_id"] = fid
-            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
+            meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = (
             f"**Classeur Excel généré** — [{fname}]({up['url']})\n\n"
             f"Colonnes : {', '.join(map(str, columns))} — {len(rows)} ligne(s)."

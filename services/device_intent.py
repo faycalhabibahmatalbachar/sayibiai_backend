@@ -24,12 +24,18 @@ def _normalize_phone(raw: str) -> Optional[str]:
     s = raw.strip()
     if not s:
         return None
+    digits = re.sub(r"\D", "", s)
     if s.startswith("00"):
-        digits = re.sub(r"\D", "", s[2:])
-    else:
-        digits = re.sub(r"\D", "", s)
+        digits = digits[2:]
     if len(digits) < 8:
         return None
+    # Numéros locaux Tchad (8 chiffres) -> +235XXXXXXXX
+    if len(digits) == 8:
+        return f"+235{digits}"
+    if digits.startswith("0") and len(digits) == 9:
+        return f"+235{digits[1:]}"
+    if digits.startswith("235") and len(digits) >= 11:
+        return f"+{digits}"
     return f"+{digits}"
 
 

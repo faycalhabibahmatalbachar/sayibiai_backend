@@ -19,11 +19,23 @@ def normalize_name(name: str) -> str:
 
 def normalize_phone(phone: str) -> str:
     raw = (phone or "").strip()
-    sign = "+" if raw.startswith("+") else ""
     digits = re.sub(r"\D", "", raw)
     if not digits:
         return ""
-    return f"{sign}{digits}" if sign else f"+{digits}"
+    if raw.startswith("+"):
+        return f"+{digits}"
+    if raw.startswith("00"):
+        return f"+{digits[2:]}" if len(digits) > 2 else ""
+    # Défaut Tchad: 8 chiffres locaux -> +235XXXXXXXX
+    if len(digits) == 8:
+        return f"+235{digits}"
+    # Formats locaux avec 0 initial (ex: 06xxxxxx)
+    if digits.startswith("0") and len(digits) == 9:
+        return f"+235{digits[1:]}"
+    # Si l'utilisateur a déjà écrit 235 sans '+'
+    if digits.startswith("235") and len(digits) >= 11:
+        return f"+{digits}"
+    return f"+{digits}"
 
 
 def mask_phone(phone: str) -> str:

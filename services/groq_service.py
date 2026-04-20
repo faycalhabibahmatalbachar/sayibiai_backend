@@ -12,6 +12,30 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 WHISPER_MODEL = "whisper-large-v3"
 logger = logging.getLogger(__name__)
+_ALLOWED_AUDIO_EXTS = {
+    ".flac",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".m4a",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+}
+_MIME_TO_EXT = {
+    "audio/webm": ".webm",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/flac": ".flac",
+}
 
 
 def _headers() -> Dict[str, str]:
@@ -102,8 +126,8 @@ async def transcribe_audio(
     settings = get_settings()
     if not settings.groq_api_key:
         raise RuntimeError("GROQ_API_KEY manquant")
-    ct = content_type or "application/octet-stream"
-    files = {"file": (filename, file_bytes, ct)}
+    clean_name, clean_ct = _normalize_audio_upload(filename, content_type)
+    files = {"file": (clean_name, file_bytes, clean_ct)}
     data = {"model": WHISPER_MODEL, "response_format": "verbose_json"}
     headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -128,6 +152,29 @@ async def transcribe_audio(
                 r2.raise_for_status()
                 return r2.json()
             raise
+
+
+def _normalize_audio_upload(
+    filename: str,
+    content_type: Optional[str],
+) -> tuple[str, str]:
+    """Ensure Groq receives a supported audio filename/content-type."""
+    name = (filename or "audio.webm").strip()
+    ct_raw = (content_type or "").split(";", 1)[0].strip().lower()
+    ext = ""
+    if "." in name:
+        ext = f".{name.rsplit('.', 1)[-1].lower()}"
+
+    if ext not in _ALLOWED_AUDIO_EXTS:
+        guessed_ext = _MIME_TO_EXT.get(ct_raw, ".webm")
+        base = name.rsplit(".", 1)[0] if "." in name else name
+        name = f"{base or 'audio'}{guessed_ext}"
+        ext = guessed_ext
+
+    if not ct_raw or ct_raw == "application/octet-stream":
+        ct_raw = next((k for k, v in _MIME_TO_EXT.items() if v == ext), "audio/webm")
+
+    return name, ct_raw
 
 
 def extract_text_and_usage(completion: Dict[str, Any]) -> tuple[str, Optional[int]]:

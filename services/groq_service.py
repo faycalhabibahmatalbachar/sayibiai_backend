@@ -1,5 +1,6 @@
 """Client Groq — LLM (Llama) et transcription Whisper."""
 
+import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -10,6 +11,7 @@ GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 WHISPER_MODEL = "whisper-large-v3"
+logger = logging.getLogger(__name__)
 
 
 def _headers() -> Dict[str, str]:
@@ -106,8 +108,26 @@ async def transcribe_audio(
     headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(GROQ_WHISPER_URL, headers=headers, data=data, files=files)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError:
+            # Some Groq deployments reject verbose_json for specific audio inputs.
+            if r.status_code == 400:
+                logger.warning(
+                    "Groq verbose_json transcription failed with 400, retrying with json. body=%s",
+                    (r.text or "")[:400],
+                )
+                fallback_data = {"model": WHISPER_MODEL, "response_format": "json"}
+                r2 = await client.post(
+                    GROQ_WHISPER_URL,
+                    headers=headers,
+                    data=fallback_data,
+                    files=files,
+                )
+                r2.raise_for_status()
+                return r2.json()
+            raise
 
 
 def extract_text_and_usage(completion: Dict[str, Any]) -> tuple[str, Optional[int]]:

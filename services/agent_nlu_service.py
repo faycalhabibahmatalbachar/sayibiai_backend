@@ -29,7 +29,7 @@ Règles critiques :
 
 Valeurs autorisées pour "action" (string) :
 search_contacts | get_contact_details | send_sms | make_call | send_email | send_whatsapp |
-create_event | search_events | update_event | delete_event | create_reminder | set_alarm |
+create_event | search_events | update_event | delete_event | create_reminder | set_alarm | update_alarm | delete_alarm | view_alarms |
 check_permission | request_permission | open_app | take_photo | get_location |
 web_search | open_map | get_directions |
 confirm_needed | clarify_contact | clarify_number | ask_missing_info |
@@ -134,6 +134,11 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
         )
     if body.permission_state:
         ctx_parts.append("Permissions client :\n" + json.dumps(body.permission_state, ensure_ascii=False))
+    if body.memory_context:
+        ctx_parts.append(
+            "Mémoire client (historique des actions précédentes) :\n"
+            + body.memory_context.strip()[:8000]
+        )
     if hints:
         ctx_parts.append(hints)
 

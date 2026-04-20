@@ -58,13 +58,31 @@ async def synthesize(
     Retourne (audio_bytes, mime_type).
     Ordre : Kokoro si demandé et configuré, sinon ElevenLabs.
     """
+    errors: list[str] = []
+
+    async def _try(name: str, fn):
+        try:
+            data = await fn()
+            if data:
+                return data
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+        return None
+
     if prefer_kokoro and get_settings().kokoro_tts_url:
-        data = await synthesize_kokoro(text, language)
-        return data, "audio/mpeg"
+        data = await _try("kokoro", lambda: synthesize_kokoro(text, language))
+        if data:
+            return data, "audio/mpeg"
+
     if get_settings().elevenlabs_api_key:
-        data = await synthesize_elevenlabs(text, voice)
-        return data, "audio/mpeg"
+        data = await _try("elevenlabs", lambda: synthesize_elevenlabs(text, voice))
+        if data:
+            return data, "audio/mpeg"
+
     if get_settings().kokoro_tts_url:
-        data = await synthesize_kokoro(text, language)
-        return data, "audio/mpeg"
-    raise RuntimeError("Aucun service TTS configuré (ElevenLabs ou Kokoro)")
+        data = await _try("kokoro", lambda: synthesize_kokoro(text, language))
+        if data:
+            return data, "audio/mpeg"
+
+    detail = f" ({'; '.join(errors)})" if errors else ""
+    raise RuntimeError("Aucun service TTS opérationnel (ElevenLabs/Kokoro)" + detail)

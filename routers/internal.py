@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from core.config import get_settings
 from core.responses import error_response, success_response
-from services import fcm_service
+from services import alarm_service, fcm_service
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -52,3 +52,25 @@ async def internal_fcm_test(
         return success_response(result, "Message FCM envoyé")
     except Exception as e:
         return error_response(str(e), 502)
+
+
+@router.post("/alarms/tick")
+async def internal_alarms_tick(
+    x_sayibi_internal_secret: str = Header(..., alias="X-Sayibi-Internal-Secret"),
+):
+    """
+    Tick scheduler interne : déclenche les alarmes dues et envoie les push fallback.
+    """
+    expected = (get_settings().sayibi_internal_secret or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="SAYIBI_INTERNAL_SECRET non configuré sur le serveur",
+        )
+    if x_sayibi_internal_secret != expected:
+        raise HTTPException(status_code=403, detail="Secret interne invalide")
+    try:
+        data = await alarm_service.run_due_alarms_tick()
+        return success_response(data, "Tick alarmes exécuté")
+    except Exception as e:
+        return error_response(str(e), 500)

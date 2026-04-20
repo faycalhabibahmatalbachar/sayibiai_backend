@@ -5,6 +5,7 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.database import get_supabase_admin
 from core.config import get_settings
 from services import file_generator, groq_service, mistral_service
 
@@ -56,6 +57,26 @@ async def create_from_chat(
     ct = (create_type or "cv").lower()
     meta: Dict[str, Any] = {}
 
+    def _store_generated(file_type: str, filename: str, object_key: str) -> Optional[str]:
+        c = get_supabase_admin()
+        if not c:
+            return None
+        try:
+            gid = str(uuid.uuid4())
+            c.table("generated_files").insert(
+                {
+                    "id": gid,
+                    "user_id": user_id,
+                    "file_type": file_type,
+                    "filename": filename,
+                    "storage_path": object_key,
+                    "prompt_used": user_message[:2000],
+                }
+            ).execute()
+            return gid
+        except Exception:
+            return None
+
     if ct == "cv":
         system = (
             "Tu extrais des données pour un CV. Réponds avec UN SEUL objet JSON, sans markdown, "
@@ -90,6 +111,10 @@ async def create_from_chat(
             "filename": fname,
             "url": up["url"],
         }
+        fid = _store_generated("cv", fname, up["object_key"])
+        if fid:
+            meta["generated_file"]["file_id"] = fid
+            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
         text = (
             f"**CV généré** — téléchargement : [{fname}]({up['url']})\n\n"
             "Vous pouvez ouvrir le fichier Word et ajuster la mise en forme."
@@ -108,6 +133,10 @@ async def create_from_chat(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
         meta["generated_file"] = {"type": "letter", "filename": fname, "url": up["url"]}
+        fid = _store_generated("letter", fname, up["object_key"])
+        if fid:
+            meta["generated_file"]["file_id"] = fid
+            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
         text = f"**Lettre générée** — [{fname}]({up['url']})"
         return text, f"Sayibi Création ({model})", tok, meta
 
@@ -126,6 +155,10 @@ async def create_from_chat(
         fname = f"rapport_{uuid.uuid4().hex[:8]}.pdf"
         up = await file_generator.upload_generated(pdf, "reports", fname, "application/pdf")
         meta["generated_file"] = {"type": "report", "filename": fname, "url": up["url"]}
+        fid = _store_generated("report", fname, up["object_key"])
+        if fid:
+            meta["generated_file"]["file_id"] = fid
+            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
         text = f"**Rapport PDF généré** — [{fname}]({up['url']})\n\n{body[:800]}{'…' if len(body) > 800 else ''}"
         return text, f"Sayibi Création ({model})", tok, meta
 
@@ -153,6 +186,10 @@ async def create_from_chat(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         meta["generated_file"] = {"type": "excel", "filename": fname, "url": up["url"]}
+        fid = _store_generated("excel", fname, up["object_key"])
+        if fid:
+            meta["generated_file"]["file_id"] = fid
+            meta["generated_file"]["download_url"] = f"/api/v1/generate/download/{fid}"
         text = (
             f"**Classeur Excel généré** — [{fname}]({up['url']})\n\n"
             f"Colonnes : {', '.join(map(str, columns))} — {len(rows)} ligne(s)."

@@ -283,13 +283,35 @@ async def _yield_image_tool_stream(
     prompt = image_gen_service.finalize_prompt_for_image_generation(user_message)
     for ch in "✨ Génération de l’image…\n\n":
         yield ch
-    text, urls = await image_gen_service.generate_image_and_upload(
-        prompt,
-        user_id or "anon",
-    )
-    meta["image_urls"] = urls
-    for ch in text:
-        yield ch
+    try:
+        text, urls = await image_gen_service.generate_image_and_upload(
+            prompt,
+            user_id or "anon",
+        )
+        meta["image_urls"] = urls
+        for ch in text:
+            yield ch
+        return
+    except Exception:
+        # Fallback robuste : proposer des images web au lieu d'échouer.
+        try:
+            web_imgs = await search_service.web_image_search(user_message, max_results=6)
+        except Exception:
+            web_imgs = []
+        if web_imgs:
+            urls = [
+                i.get("url", "")
+                for i in web_imgs
+                if isinstance(i, dict) and i.get("url")
+            ]
+            if urls:
+                meta["image_urls"] = urls[:6]
+                meta["search_images"] = web_imgs
+                fallback = "🖼️ Génération IA indisponible, voici des images pertinentes trouvées sur le web."
+                for ch in fallback:
+                    yield ch
+                return
+        raise
 
 
 async def run_chat(
@@ -321,12 +343,31 @@ async def run_chat(
         document_creation_flow=doc_flow,
     ):
         prompt = image_gen_service.finalize_prompt_for_image_generation(user_message)
-        text, urls = await image_gen_service.generate_image_and_upload(
-            prompt,
-            user_id or "anon",
-        )
-        meta["image_urls"] = urls
-        return text, "Sayibi Images", None, meta
+        try:
+            text, urls = await image_gen_service.generate_image_and_upload(
+                prompt,
+                user_id or "anon",
+            )
+            meta["image_urls"] = urls
+            return text, "Sayibi Images", None, meta
+        except Exception:
+            # Fallback en mode non-stream aussi.
+            web_imgs = await search_service.web_image_search(user_message, max_results=6)
+            urls = [
+                i.get("url", "")
+                for i in web_imgs
+                if isinstance(i, dict) and i.get("url")
+            ]
+            if urls:
+                meta["image_urls"] = urls[:6]
+                meta["search_images"] = web_imgs
+                return (
+                    "🖼️ Génération IA indisponible, voici des images pertinentes trouvées sur le web.",
+                    "Sayibi Images (fallback web)",
+                    None,
+                    meta,
+                )
+            raise
 
     if create_mode and create_type:
         text, model, tok, cmeta = await chat_creation_service.create_from_chat(

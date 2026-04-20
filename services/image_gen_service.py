@@ -1,4 +1,4 @@
-"""Génération d'images réelle — Gemini (modalités IMAGE) uniquement (pas de DALL·E payant)."""
+"""Génération d'images réelle — Gemini natif (robuste, multi-modèles)."""
 
 import base64
 import logging
@@ -101,28 +101,95 @@ def _ordered_unique_models(dynamic_models: List[str]) -> List[str]:
     return out
 
 
+def _request_body(prompt: str, image_only: bool) -> dict:
+    return {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"] if image_only else ["TEXT", "IMAGE"],
+            "temperature": 0.8,
+        },
+    }
+
+
 async def _try_gemini_native_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
     """Retourne (png_bytes, mime) ou (None, None)."""
     settings = get_settings()
     if not settings.gemini_api_key:
         return None, None
 
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-            "temperature": 0.8,
-        },
-    }
-
     async with httpx.AsyncClient(timeout=180.0) as client:
         dynamic_models = await _discover_gemini_image_models(client)
         model_candidates = _ordered_unique_models(dynamic_models)
         for model in model_candidates:
+            # Deux variantes de payload + retries courts sur erreurs transitoires.
+            for image_only in (True, False):
+                body = _request_body(prompt, image_only=image_only)
+                for attempt in range(3):
+                    try:
+                        r = await client.post(_gemini_endpoint(model), json=body)
+                        if r.status_code >= 400:
+                            logger.warning(
+                                "Gemini image %s HTTP %s (try %s): %s",
+                                model,
+                                r.status_code,
+                                attempt + 1,
+                                r.text[:300],
+                            )
+                            if r.status_code in (408, 429, 500, 502, 503, 504):
+                                continue
+                            break
+                        data = r.json()
+                        parts = (
+                            data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [])
+                        )
+                        for p in parts:
+                            inline = p.get("inlineData") or p.get("inline_data")
+                            if not inline:
+                                continue
+                            b64 = inline.get("data")
+                            mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
+                            if b64:
+                                return base64.b64decode(b64), mime
+                    except Exception as e:
+                        logger.warning(
+                            "Gemini image model %s error (try %s): %s",
+                            model,
+                            attempt + 1,
+                            e,
+                        )
+                        continue
+    return None, None
+
+
+async def image_health_check() -> dict:
+    """
+    Vérifie en live quels modèles Gemini image répondent effectivement.
+    """
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        return {
+            "configured": False,
+            "available_models": [],
+            "working_models": [],
+            "errors": {"config": "GEMINI_API_KEY manquant"},
+        }
+
+    probe_prompt = "Simple geometric blue circle on white background."
+    working: List[str] = []
+    errors: dict = {}
+    discovered: List[str] = []
+    candidates: List[str] = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        discovered = await _discover_gemini_image_models(client)
+        candidates = _ordered_unique_models(discovered)
+        for model in candidates:
             try:
+                body = _request_body(probe_prompt, image_only=True)
                 r = await client.post(_gemini_endpoint(model), json=body)
                 if r.status_code >= 400:
-                    logger.warning("Gemini image %s HTTP %s: %s", model, r.status_code, r.text[:300])
+                    errors[model] = f"HTTP {r.status_code}"
                     continue
                 data = r.json()
                 parts = (
@@ -130,18 +197,25 @@ async def _try_gemini_native_image(prompt: str) -> Tuple[Optional[bytes], Option
                     .get("content", {})
                     .get("parts", [])
                 )
+                has_image = False
                 for p in parts:
                     inline = p.get("inlineData") or p.get("inline_data")
-                    if not inline:
-                        continue
-                    b64 = inline.get("data")
-                    mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
-                    if b64:
-                        return base64.b64decode(b64), mime
+                    if inline and inline.get("data"):
+                        has_image = True
+                        break
+                if has_image:
+                    working.append(model)
+                else:
+                    errors[model] = "No image bytes in response"
             except Exception as e:
-                logger.warning("Gemini image model %s: %s", model, e)
-                continue
-    return None, None
+                errors[model] = str(e)[:220]
+    return {
+        "configured": True,
+        "available_models": candidates,
+        "discovered_models": discovered,
+        "working_models": working,
+        "errors": errors,
+    }
 
 
 async def generate_image_and_upload(
@@ -159,8 +233,8 @@ async def generate_image_and_upload(
 
     if not raw:
         raise RuntimeError(
-            "Génération d’image indisponible : configurez GEMINI_API_KEY avec un modèle "
-            "supportant la sortie image (Google AI Studio / Gemini).",
+            "Génération d’image indisponible : vérifiez GEMINI_API_KEY et l'accès "
+            "aux modèles image Gemini (AI Studio).",
         )
 
     ext = "png" if "png" in mime else "jpg"

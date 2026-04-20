@@ -58,7 +58,11 @@ async def upload_bytes(
         ContentType=content_type,
     )
     public = settings.r2_public_url.rstrip("/") if settings.r2_public_url else ""
-    url = f"{public}/{object_key}" if public else f"r2://{settings.r2_bucket}/{object_key}"
+    if public:
+        url = f"{public}/{object_key}"
+    else:
+        signed = get_presigned_url(object_key, expires_in=60 * 60 * 24)
+        url = signed or f"r2://{settings.r2_bucket}/{object_key}"
     return object_key, url
 
 

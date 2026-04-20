@@ -5,6 +5,7 @@ import uuid
 from typing import Any, List
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import RedirectResponse
 
 from core.deps import get_current_user_id
 from core.database import get_supabase_admin
@@ -17,9 +18,39 @@ from models.generate import (
     GenerateReportRequest,
 )
 from services import ai_router, file_generator
+from services import storage_service
 from services.usage_service import log_usage
 
 router = APIRouter(prefix="/generate", tags=["generate"])
+
+
+def _store_generated_file(
+    user_id: str,
+    file_type: str,
+    filename: str,
+    storage_path: str,
+    prompt_used: str = "",
+    session_id: str | None = None,
+) -> str | None:
+    c = get_supabase_admin()
+    if not c:
+        return None
+    try:
+        gid = str(uuid.uuid4())
+        c.table("generated_files").insert(
+            {
+                "id": gid,
+                "user_id": user_id,
+                "file_type": file_type,
+                "filename": filename,
+                "storage_path": storage_path,
+                "prompt_used": (prompt_used or "")[:2000] or None,
+                "session_id": session_id,
+            }
+        ).execute()
+        return gid
+    except Exception:
+        return None
 
 
 async def _llm_json(prompt: str):
@@ -51,21 +82,16 @@ async def generate_cv(body: GenerateCVRequest, user_id: str = Depends(get_curren
     )
     fname = f"CV_{p.get('full_name', 'sayibi').replace(' ', '_')}.docx"
     meta = await file_generator.upload_generated(data, "cv", fname, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    c = get_supabase_admin()
-    if c:
-        try:
-            c.table("generated_files").insert(
-                {
-                    "id": str(uuid.uuid4()),
-                    "user_id": user_id,
-                    "file_type": "cv",
-                    "filename": meta["filename"],
-                    "storage_path": meta["object_key"],
-                    "prompt_used": json.dumps(p)[:2000],
-                },
-            ).execute()
-        except Exception:
-            pass
+    fid = _store_generated_file(
+        user_id=user_id,
+        file_type="cv",
+        filename=meta["filename"],
+        storage_path=meta["object_key"],
+        prompt_used=json.dumps(p),
+    )
+    if fid:
+        meta["file_id"] = fid
+        meta["download_url"] = f"/api/v1/generate/download/{fid}"
     await log_usage(user_id, "/generate/cv", None, "generate")
     return success_response(meta, "CV généré")
 
@@ -86,6 +112,16 @@ async def generate_letter(body: GenerateLetterRequest, user_id: str = Depends(ge
         title,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+    fid = _store_generated_file(
+        user_id=user_id,
+        file_type="letter",
+        filename=meta["filename"],
+        storage_path=meta["object_key"],
+        prompt_used=prompt,
+    )
+    if fid:
+        meta["file_id"] = fid
+        meta["download_url"] = f"/api/v1/generate/download/{fid}"
     await log_usage(user_id, "/generate/letter", tok, "llm")
     return success_response(meta, "Lettre générée")
 
@@ -101,6 +137,16 @@ async def generate_report(body: GenerateReportRequest, user_id: str = Depends(ge
     pdf = file_generator.build_report_pdf(body.topic, body.sections, body_text)
     fname = f"rapport_{uuid.uuid4().hex[:8]}.pdf"
     meta = await file_generator.upload_generated(pdf, "reports", fname, "application/pdf")
+    fid = _store_generated_file(
+        user_id=user_id,
+        file_type="report",
+        filename=meta["filename"],
+        storage_path=meta["object_key"],
+        prompt_used=prompt,
+    )
+    if fid:
+        meta["file_id"] = fid
+        meta["download_url"] = f"/api/v1/generate/download/{fid}"
     await log_usage(user_id, "/generate/report", tok, "llm")
     return success_response(meta, "Rapport généré")
 
@@ -133,6 +179,16 @@ async def generate_excel(body: GenerateExcelRequest, user_id: str = Depends(get_
         fname,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    fid = _store_generated_file(
+        user_id=user_id,
+        file_type="excel",
+        filename=meta["filename"],
+        storage_path=meta["object_key"],
+        prompt_used=prompt,
+    )
+    if fid:
+        meta["file_id"] = fid
+        meta["download_url"] = f"/api/v1/generate/download/{fid}"
     await log_usage(user_id, "/generate/excel", tok, "llm")
     return success_response(meta, "Excel généré")
 
@@ -168,6 +224,7 @@ async def generate_from_chat(body: GenerateFromChatRequest, user_id: str = Depen
             f"chat_export_{uuid.uuid4().hex[:8]}.pdf",
             "application/pdf",
         )
+        file_type = "report"
     else:
         docx = file_generator.build_letter_docx(text, title="Export conversation")
         meta = await file_generator.upload_generated(
@@ -176,5 +233,47 @@ async def generate_from_chat(body: GenerateFromChatRequest, user_id: str = Depen
             f"chat_export_{uuid.uuid4().hex[:8]}.docx",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
+        file_type = "letter"
+    fid = _store_generated_file(
+        user_id=user_id,
+        file_type=file_type,
+        filename=meta["filename"],
+        storage_path=meta["object_key"],
+        prompt_used=prompt,
+        session_id=body.session_id,
+    )
+    if fid:
+        meta["file_id"] = fid
+        meta["download_url"] = f"/api/v1/generate/download/{fid}"
     await log_usage(user_id, "/generate/from_chat", tok, "llm")
     return success_response(meta, "Document créé depuis le chat")
+
+
+@router.get("/download/{file_id}")
+async def download_generated_file(file_id: str, user_id: str = Depends(get_current_user_id)):
+    """Téléchargement sécurisé d'un fichier généré appartenant à l'utilisateur."""
+    c = get_supabase_admin()
+    if not c:
+        return error_response("Base indisponible", 503)
+    try:
+        res = (
+            c.table("generated_files")
+            .select("id,user_id,filename,storage_path")
+            .eq("id", file_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return error_response("Fichier introuvable", 404)
+        row = rows[0]
+        storage_path = row.get("storage_path")
+        if not storage_path:
+            return error_response("Chemin de stockage manquant", 500)
+        signed = storage_service.get_presigned_url(storage_path, expires_in=60 * 60 * 24)
+        if signed:
+            return RedirectResponse(url=signed, status_code=307)
+        return error_response("Téléchargement indisponible", 503)
+    except Exception as e:
+        return error_response(str(e), 500)

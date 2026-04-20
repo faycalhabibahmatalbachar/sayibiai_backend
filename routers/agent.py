@@ -7,7 +7,12 @@ from fastapi import APIRouter, Depends
 from core.deps import get_current_user_id
 from core.database import get_supabase_admin
 from core.responses import error_response, success_response
-from models.agent import AgentLogRequest, AgentTurnRequest, ContactResolutionBody
+from models.agent import (
+    AgentLogRequest,
+    AgentTurnRequest,
+    ContactResolutionBody,
+    AgentMemorySummaryQuery,
+)
 from services import agent_nlu_service
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -75,5 +80,57 @@ async def save_contact_resolution(
             }
         ).execute()
         return success_response({"stored": True}, "Préférence enregistrée")
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@router.post("/memory-summary")
+async def agent_memory_summary(
+    body: AgentMemorySummaryQuery,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Retourne un résumé mémoire serveur des dernières actions agent."""
+    c = _db()
+    if not c:
+        return success_response({"sms_actions": [], "contact_preferences": []}, "Sans DB")
+    try:
+        sms_rows = (
+            c.table("agent_action_logs")
+            .select(
+                "action_type, phone_masked, message_preview, status, confidence, client_meta, created_at"
+            )
+            .eq("user_id", user_id)
+            .in_("action_type", ["send_sms", "send_sms_scheduled"])
+            .order("created_at", desc=True)
+            .limit(body.limit)
+            .execute()
+        ).data or []
+
+        pref_rows = (
+            c.table("contact_resolutions")
+            .select("query, contact_id_chosen, display_name_snapshot, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(max(5, body.limit))
+            .execute()
+        ).data or []
+
+        alarm_rows = (
+            c.table("alarms")
+            .select("id, title, scheduled_for, status, is_enabled, created_at")
+            .eq("user_id", user_id)
+            .order("scheduled_for", desc=False)
+            .limit(body.limit)
+            .execute()
+        ).data or []
+
+        return success_response(
+            {
+                "sms_actions": sms_rows,
+                "contact_preferences": pref_rows,
+                "alarms": alarm_rows,
+            },
+            "Mémoire récupérée",
+        )
     except Exception as e:
         return error_response(str(e), 500)

@@ -20,6 +20,9 @@ class AgentTurnRequest(BaseModel):
     permission_state: Optional[Dict[str, bool]] = None
     """Ex. {\"contacts\": true, \"sms\": false}."""
 
+    memory_context: Optional[str] = None
+    """Résumé mémoire fourni par le client (historique SMS/actions)."""
+
 
 class AgentLogRequest(BaseModel):
     action_type: str
@@ -37,6 +40,10 @@ class ContactResolutionBody(BaseModel):
     contact_id_chosen: str
     display_name_snapshot: Optional[str] = None
     resolution_type: str = "user_picked"
+
+
+class AgentMemorySummaryQuery(BaseModel):
+    limit: int = Field(10, ge=1, le=50)
 
 
 class AgentStructuredResponse(BaseModel):

@@ -14,7 +14,7 @@ router = APIRouter(prefix="/internal", tags=["internal"])
 
 class InternalFcmTestBody(BaseModel):
     fcm_token: str = Field(..., min_length=10)
-    title: str = "SAYIBI — test"
+    title: str = "ChadGpt — test"
     body: str = "Notification de test (endpoint interne)."
     data: Optional[Dict[str, str]] = None
 

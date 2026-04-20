@@ -129,7 +129,7 @@ async def create_from_chat(
             f"**CV généré** — téléchargement : [{fname}]({up['url']})\n\n"
             "Vous pouvez ouvrir le fichier Word et ajuster la mise en forme."
         )
-        return text, f"Sayibi Création ({model})", tok, meta
+        return text, f"ChadGpt Création ({model})", tok, meta
 
     if ct == "letter":
         system = "Tu rédiges une lettre professionnelle complète selon la demande. Réponds avec le texte de la lettre uniquement, sans titre « Lettre » en en-tête markdown."
@@ -147,7 +147,7 @@ async def create_from_chat(
         if fid:
             meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = f"**Lettre générée** — [{fname}]({up['url']})"
-        return text, f"Sayibi Création ({model})", tok, meta
+        return text, f"ChadGpt Création ({model})", tok, meta
 
     if ct == "report":
         system = (
@@ -168,7 +168,7 @@ async def create_from_chat(
         if fid:
             meta["generated_file"].update(_build_download_meta(fid, up["object_key"]))
         text = f"**Rapport PDF généré** — [{fname}]({up['url']})\n\n{body[:800]}{'…' if len(body) > 800 else ''}"
-        return text, f"Sayibi Création ({model})", tok, meta
+        return text, f"ChadGpt Création ({model})", tok, meta
 
     if ct == "excel":
         system = (
@@ -201,6 +201,6 @@ async def create_from_chat(
             f"**Classeur Excel généré** — [{fname}]({up['url']})\n\n"
             f"Colonnes : {', '.join(map(str, columns))} — {len(rows)} ligne(s)."
         )
-        return text, f"Sayibi Création ({model})", tok, meta
+        return text, f"ChadGpt Création ({model})", tok, meta
 
     raise ValueError(f"Type de création inconnu : {ct}")

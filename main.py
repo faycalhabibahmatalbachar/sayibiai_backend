@@ -1,4 +1,4 @@
-"""Point d'entrée FastAPI — SAYIBI AI backend."""
+"""Point d'entrée FastAPI — ChadGpt backend."""
 
 import traceback
 from contextlib import asynccontextmanager
@@ -30,8 +30,8 @@ _settings = get_settings()
 _show_docs = _settings.environment == "development" or _settings.debug
 
 app = FastAPI(
-    title="SAYIBI AI API",
-    description="Backend multilingue FR/AR/EN — chat, documents, voix, génération, recherche.",
+    title="ChadGpt API",
+    description="Backend multilingue FR/AR/EN — chat, documents, voix, génération, recherche (ChadGpt).",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs" if _show_docs else None,
@@ -110,7 +110,7 @@ async def health():
 async def root():
     s = get_settings()
     docs = "/docs" if (s.environment == "development" or s.debug) else None
-    return {"name": "SAYIBI AI", "docs": docs, "health": "/health"}
+    return {"name": "ChadGpt", "docs": docs, "health": "/health"}
 
 
 @app.exception_handler(RequestValidationError)

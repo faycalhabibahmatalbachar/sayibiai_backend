@@ -15,26 +15,29 @@ from core.database import get_supabase_admin
 from models.agent import AgentStructuredResponse, AgentTurnRequest
 from services import groq_service, mistral_service
 
-# Prompt condensé — aligné sur la spec SAYIBI Agent v2 (intentions, permissions, confirmation).
-AGENT_SYSTEM_PROMPT = """Tu es le moteur NLU et d'orchestration de SAYIBI AI pour actions natives (SMS, appels, agenda, etc.).
+# Prompt condensé — mode agent ChadGpt (intentions, permissions, exécution auto).
+AGENT_SYSTEM_PROMPT = """Tu es le moteur NLU et d'orchestration de ChadGpt pour actions natives (SMS, appels, agenda, etc.).
 
 Règles critiques :
+0) Identité obligatoire : si l'utilisateur demande qui tu es, ton nom, ou qui t'a créé/développé, mets dans message_to_user exactement : « Je suis ChadGpt, un assistant créé par Faycal Habib Ahmat. » Ne te présente jamais comme ChatGPT, OpenAI, SAYIBI AI ou une autre marque ; tu es uniquement ChadGpt, créé par Faycal Habib Ahmat.
 1) Analyse l'intention et extrais les entités (contact_name, phone_number, message_content, time, location, urgency).
 2) Avant toute action sensible, vérifie les permissions nécessaires (contacts, sms, phone, calendar, camera, location). Si inconnu, utilise action "permission_needed" avec required_permissions.
-3) Jamais d'envoi SMS / appel / email / suppression sans confirmation explicite de l'utilisateur. Si l'action est prête mais pas confirmée : "confirm_needed".
+3) Envoi AUTO : n'exige jamais de confirmation explicite pour SMS / appel / email / suppression. Quand l'action est prête, réponds directement avec "execute_action".
 4) Ambiguïtés : plusieurs contacts → "clarify_contact" avec matches ; plusieurs numéros → "clarify_number". Aucun contact → "ask_missing_info".
-5) Si le message est une confirmation ("oui", "ok", "envoie", "vas-y", "confirme") et que pending décrit une action en attente → "execute_action" avec les champs du pending. Si annulation ("non", "annule") → action "cancelled".
+5) N'utilise la confirmation que pour gérer d'anciens états pending ; par défaut, exécute directement via "execute_action" dès que les champs requis sont présents.
 6) Si le client a fourni contact_search_results, utilise-les pour décider (ne invente pas de contacts).
 7) message_to_user : français naturel, court. Masque partiellement les numéros dans les messages utilisateur (+235 6 12 ••• •• 78).
 8) Les outils réels sont côté client ; si tu as besoin de données contacts, réponds par action "search_contacts" avec payload.query (le client renverra les résultats au tour suivant).
 9) Pour les médias locaux du téléphone: utilise "search_local_media" avec payload.query (et éventuellement payload.media_type=image|video). Pour ouvrir un élément choisi: "open_local_media" avec payload.path.
+10) Pour le gestionnaire de fichiers (PDF, DOC, ZIP, audio, etc.): utilise "search_local_files" avec payload.query (et payload.kind=any|document|audio|video|image|archive|file). Pour ouvrir: "open_local_file" avec payload.path.
+11) Ne retourne jamais "confirm_needed". Utilise "execute_action" dès que l'action est déterminée.
 
 Valeurs autorisées pour "action" (string) :
 search_contacts | get_contact_details | send_sms | make_call | send_email | send_whatsapp |
 create_event | search_events | update_event | delete_event | create_reminder | set_alarm | update_alarm | delete_alarm | view_alarms |
-check_permission | request_permission | open_app | take_photo | get_location | search_local_media | open_local_media |
+check_permission | request_permission | open_app | take_photo | get_location | search_local_media | open_local_media | search_local_files | open_local_file |
 web_search | open_map | get_directions |
-confirm_needed | clarify_contact | clarify_number | ask_missing_info |
+clarify_contact | clarify_number | ask_missing_info |
 permission_needed | alternative_suggested | execute_action | cancelled |
 log_action | error | rate_limit_exceeded
 
@@ -59,6 +62,41 @@ def _parse_agent_json(raw: str) -> AgentStructuredResponse:
     cleaned = _strip_json_fence(raw)
     data = json.loads(cleaned)
     return AgentStructuredResponse.model_validate(data)
+
+
+def _force_auto_execute(resp: AgentStructuredResponse) -> AgentStructuredResponse:
+    """Convertit tout confirm_needed résiduel en execute_action."""
+    if resp.action != "confirm_needed":
+        return resp
+
+    payload = dict(resp.payload or {})
+    effective = payload
+    if isinstance(payload.get("pending"), dict):
+        pending = dict(payload.get("pending") or {})
+        pending_payload = pending.get("payload")
+        if isinstance(pending_payload, dict):
+            effective = dict(pending_payload)
+            if "action_type" not in effective and "action" in pending:
+                effective["action_type"] = str(pending.get("action") or "").strip()
+        else:
+            effective = pending
+
+    if "action_type" not in effective and "type" in effective:
+        effective["action_type"] = str(effective.get("type") or "").strip()
+    if "action_type" not in effective and "action" in effective:
+        effective["action_type"] = str(effective.get("action") or "").strip()
+
+    if not (effective.get("action_type") or "").strip():
+        # Fallback minimal pour laisser le client tracer l'échec proprement.
+        effective["action_type"] = "execute"
+
+    return resp.model_copy(
+        update={
+            "action": "execute_action",
+            "payload": effective,
+            "message_to_user": "Exécution automatique en cours.",
+        }
+    )
 
 
 def _hint_query_from_body(body: AgentTurnRequest) -> str:
@@ -204,7 +242,7 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
             else:
                 comp = await _groq_with_retry(json_mode=False)
                 raw_text, tokens = groq_service.extract_text_and_usage(comp)
-        return _parse_agent_json(raw_text), tokens
+        return _force_auto_execute(_parse_agent_json(raw_text)), tokens
     except (json.JSONDecodeError, ValidationError):
         try:
             try:
@@ -212,7 +250,7 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
                 raw_text, tokens = groq_service.extract_text_and_usage(comp)
             except Exception:
                 raw_text, tokens = await _mistral_fallback()
-            return _parse_agent_json(raw_text), tokens
+            return _force_auto_execute(_parse_agent_json(raw_text)), tokens
         except Exception as e2:
             return (
                 AgentStructuredResponse(

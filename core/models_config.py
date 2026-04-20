@@ -1,6 +1,6 @@
 """
-Configuration des modèles SAYIBI AI.
-Chaque modèle Sayibi mappe vers un ou plusieurs modèles LLM réels.
+Configuration des modèles ChadGpt (identifiants API sayibi-* conservés pour compatibilité).
+Chaque entrée mappe vers un ou plusieurs modèles LLM réels.
 """
 
 from dataclasses import dataclass
@@ -36,7 +36,7 @@ class ModelConfig:
 SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
     SayibiModel.AUTO: ModelConfig(
         display_name="Auto",
-        tagline="Laisse SAYIBI choisir",
+        tagline="Laisse ChadGpt choisir",
         description="Sélection automatique du meilleur modèle selon votre requête",
         backend_model="llama-3.3-70b-versatile",
         provider="groq",
@@ -48,7 +48,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=True,
     ),
     SayibiModel.REFLEXION: ModelConfig(
-        display_name="Sayibi Réflexion",
+        display_name="ChadGpt Réflexion",
         tagline="Notre modèle le plus intelligent",
         description="Raisonnement profond, analyses complexes, problèmes difficiles. "
         "Prend le temps de réfléchir avant de répondre.",
@@ -62,7 +62,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=True,
     ),
     SayibiModel.IMAGES: ModelConfig(
-        display_name="Sayibi Images",
+        display_name="ChadGpt Images",
         tagline="Crée des images depuis vos descriptions",
         description="Génération d'images professionnelles, illustrations, designs "
         "depuis une description texte.",
@@ -76,7 +76,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=False,
     ),
     SayibiModel.NADIRX: ModelConfig(
-        display_name="Sayibi NadirX",
+        display_name="ChadGpt NadirX",
         tagline="Expert analyse & données",
         description="Analyse de documents complexes, tableaux, données financières, "
         "contrats juridiques. Le plus précis pour l'extraction d'informations.",
@@ -90,7 +90,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=True,
     ),
     SayibiModel.VOIX: ModelConfig(
-        display_name="Sayibi Voix",
+        display_name="ChadGpt Voix",
         tagline="Optimisé pour les conversations vocales",
         description="Réponses courtes, claires et naturelles. "
         "Idéal pour l'assistant vocal mains-libres.",
@@ -104,7 +104,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=False,
     ),
     SayibiModel.CODE: ModelConfig(
-        display_name="Sayibi Code",
+        display_name="ChadGpt Code",
         tagline="Développeur IA expert",
         description="Génération, débogage et explication de code. "
         "Supporte +50 langages de programmation.",
@@ -118,7 +118,7 @@ SAYIBI_MODELS: dict[SayibiModel, ModelConfig] = {
         supports_files=True,
     ),
     SayibiModel.CREATION: ModelConfig(
-        display_name="Sayibi Création",
+        display_name="ChadGpt Création",
         tagline="Génère CV, lettres & rapports Pro",
         description="Spécialisé dans la création de documents professionnels "
         "avec mise en page, design et formatage avancé.",
@@ -150,7 +150,7 @@ def resolve_sayibi_preference(
     (groq_model_override, mistral_model_override, routing_hint, display_label)
 
     routing_hint: 'groq' | 'gemini' | 'mistral' | 'auto' | None
-    Si Sayibi est reconnu, routing_hint indique le fournisseur à privilégier.
+    Si une préférence sayibi-* est reconnue, routing_hint indique le fournisseur à privilégier.
     """
     raw = (model_preference or "auto").strip().lower()
     if raw in ("groq", "gemini", "mistral", "auto"):

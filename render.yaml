@@ -68,3 +68,19 @@ services:
       # Toujours définir : sinon le health check Render échoue (400 Invalid host) si le hostname n’est pas listé.
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
+  - type: cron
+    name: sayibi-alarms-tick
+    runtime: python
+    region: frankfurt
+    plan: free
+    branch: main
+    schedule: "*/1 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "import os,sys,urllib.request;u=(os.getenv('INTERNAL_TICK_URL') or '').strip();s=(os.getenv('SAYIBI_INTERNAL_SECRET') or '').strip();sys.exit('INTERNAL_TICK_URL ou SAYIBI_INTERNAL_SECRET manquant') if (not u or not s) else None;req=urllib.request.Request(u,method='POST',headers={'X-Sayibi-Internal-Secret':s});resp=urllib.request.urlopen(req,timeout=30);print(f'alarms tick status={resp.status}')"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: INTERNAL_TICK_URL
+        sync: false
+      - key: SAYIBI_INTERNAL_SECRET
+        sync: false

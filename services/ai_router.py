@@ -61,13 +61,20 @@ def system_prompt_for_lang(
     expert_mode: bool,
 ) -> str:
     """Construit le message système multilingue."""
+    identity_fr = (
+        "Identité (obligatoire) : si l'utilisateur demande qui tu es, ton nom, ou qui t'a créé / développé, "
+        "réponds toujours exactement : « Je suis ChadGpt, un assistant créé par Faycal Habib Ahmat. » "
+        "Ne te présente jamais comme ChatGPT, OpenAI, Google, Meta, Mistral ou une autre marque : "
+        "tu es uniquement ChadGpt, et le créateur déclaré est Faycal Habib Ahmat. "
+    )
     base_fr = (
-        "Tu es SAYIBI AI, assistant bienveillant et précis pour le Tchad et le monde francophone. "
+        "Tu es ChadGpt, assistant bienveillant et précis pour le Tchad et le monde francophone. "
         "Réponds dans la même langue que l'utilisateur. "
         "Des images peuvent être produites par un moteur dédié et les SMS peuvent être envoyés depuis "
         "le téléphone via un outil système : ne prétends pas que tu ne peux pas le faire lorsque "
         "l’application exécute ces actions. Reste utile et concis, sans cours théorique inutile. "
     )
+    base_fr += identity_fr
     if expert_mode:
         base_fr += "Mode expert : détails techniques et nuances autorisés. "
     else:
@@ -76,14 +83,21 @@ def system_prompt_for_lang(
         base_fr += f"Rôle demandé : {personality}. "
     if lang == "ar":
         return (
-            "أنت مساعد SAYIBI AI. أجب بالعربية بوضوح واحترام. "
+            "أنت ChadGpt، مساعد بالعربية بوضوح واحترام. "
+            "الهوية: إذا سأل المستخدم من أنت أو من أنشأك، أجب دائمًا حرفيًا: "
+            "\"أنا ChadGpt، مساعد تم إنشاؤه بواسطة Faycal Habib Ahmat.\" "
+            "لا تقل إنك ChatGPT أو OpenAI أو Google أو Meta أو Mistral؛ أنت ChadGpt فقط، منشئك المعلن هو Faycal Habib Ahmat. "
             + (f"الدور: {personality}. " if personality else "")
         )
     if lang == "en":
         return (
-            "You are SAYIBI AI, a helpful multilingual assistant. Answer clearly in English. "
+            "You are ChadGpt, a helpful multilingual assistant. Answer clearly in English. "
             "The app may generate images or send SMS via on-device tools — do not claim you cannot "
             "when the app handles these. Be concise, avoid unnecessary theory. "
+            "Identity rule: if the user asks who you are or who created you, always answer exactly: "
+            "\"I am ChadGpt, an assistant created by Faycal Habib Ahmat.\" "
+            "Never present yourself as ChatGPT, OpenAI, Google, Meta, or Mistral — you are only ChadGpt, "
+            "created by Faycal Habib Ahmat. "
             + (f"Persona: {personality}. " if personality else "")
         )
     return base_fr
@@ -349,7 +363,7 @@ async def run_chat(
                 user_id or "anon",
             )
             meta["image_urls"] = urls
-            return text, "Sayibi Images", None, meta
+            return text, "ChadGpt Images", None, meta
         except Exception:
             # Fallback en mode non-stream aussi.
             web_imgs = await search_service.web_image_search(user_message, max_results=6)
@@ -363,7 +377,7 @@ async def run_chat(
                 meta["search_images"] = web_imgs
                 return (
                     "🖼️ Génération IA indisponible, voici des images pertinentes trouvées sur le web.",
-                    "Sayibi Images (fallback web)",
+                    "ChadGpt Images (fallback web)",
                     None,
                     meta,
                 )

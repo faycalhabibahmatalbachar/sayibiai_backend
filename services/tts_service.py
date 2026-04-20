@@ -13,6 +13,12 @@ ELEVENLABS_BUILTIN_VOICES: Dict[str, str] = {
     "hassane": "c365oriviHmAhyLhpuN6",
 }
 
+class TtsProviderError(RuntimeError):
+    def __init__(self, provider: str, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.provider = provider
+        self.status_code = status_code
+
 
 async def elevenlabs_health_check() -> Dict[str, Any]:
     """
@@ -53,7 +59,7 @@ async def synthesize_elevenlabs(
     """TTS ElevenLabs (mp3)."""
     settings = get_settings()
     if not settings.elevenlabs_api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY manquant")
+        raise TtsProviderError("elevenlabs", "ELEVENLABS_API_KEY manquant")
 
     def _normalized_voice_id(candidate: Optional[str]) -> str:
         v = (candidate or "").strip()
@@ -97,21 +103,41 @@ async def synthesize_elevenlabs(
                 )
                 r2.raise_for_status()
                 return r2.content
-            raise
+            if status == 401:
+                raise TtsProviderError(
+                    "elevenlabs",
+                    "ELEVENLABS_API_KEY invalide ou expirée (401 Unauthorized)",
+                    status_code=401,
+                ) from e
+            raise TtsProviderError(
+                "elevenlabs",
+                f"Erreur ElevenLabs HTTP {status or 'inconnue'}",
+                status_code=status,
+            ) from e
+        except httpx.RequestError as e:
+            raise TtsProviderError("elevenlabs", f"Réseau ElevenLabs indisponible: {e}") from e
 
 
 async def synthesize_kokoro(text: str, language: str = "fr") -> bytes:
     """TTS Kokoro via service auto-hébergé (POST /synthesize attendu)."""
     settings = get_settings()
     if not settings.kokoro_tts_url:
-        raise RuntimeError("KOKORO_TTS_URL manquant")
+        raise TtsProviderError("kokoro", "KOKORO_TTS_URL manquant")
     url = settings.kokoro_tts_url.rstrip("/") + "/synthesize"
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(
             url,
             json={"text": text, "language": language},
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            raise TtsProviderError(
+                "kokoro",
+                f"Erreur Kokoro HTTP {status or 'inconnue'}",
+                status_code=status,
+            ) from e
         return r.content
 
 
@@ -151,5 +177,11 @@ async def synthesize(
         if data:
             return data, "audio/mpeg"
 
-    detail = f" ({'; '.join(errors)})" if errors else ""
+    joined = "; ".join(errors)
+    if "401 Unauthorized" in joined or "invalide ou expirée" in joined:
+        raise RuntimeError(
+            "Synthèse vocale indisponible: clé ElevenLabs invalide/expirée. "
+            "Mettez à jour ELEVENLABS_API_KEY ou configurez KOKORO_TTS_URL."
+        )
+    detail = f" ({joined})" if errors else ""
     raise RuntimeError("Aucun service TTS opérationnel (ElevenLabs/Kokoro)" + detail)

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from core.database import get_supabase_admin
-from services import fcm_service
+from services import notification_service
 
 
 def _db():
@@ -152,35 +152,34 @@ async def run_due_alarms_tick(now: Optional[datetime] = None) -> Dict[str, Any]:
         processed += 1
         user_id = str(alarm.get("user_id") or "")
         alarm_id = str(alarm.get("id") or "")
-        title = str(alarm.get("title") or "SAYIBI — Alarme")
+        title = str(alarm.get("title") or "ChadGpt — Alarme")
         body = str(alarm.get("message") or "Rappel arrivé à échéance.")
-        ok = False
-        # multi-device tokens
-        tokens = []
+        # Claim atomique best-effort pour éviter les doubles envois
         try:
-            rows = c.table("fcm_device_tokens").select("token").eq("user_id", user_id).execute().data or []
-            tokens = [str(r.get("token")) for r in rows if r.get("token")]
-        except Exception:
-            tokens = []
-        if not tokens:
-            try:
-                row = c.table("users").select("fcm_token").eq("id", user_id).single().execute()
-                tk = (row.data or {}).get("fcm_token") if row.data else None
-                if tk:
-                    tokens = [str(tk)]
-            except Exception:
-                pass
-        for tk in list(dict.fromkeys(tokens)):
-            try:
-                await fcm_service.send_notification(
-                    tk,
-                    title,
-                    body,
-                    {"type": "alarm_due", "alarm_id": alarm_id, "user_id": user_id},
-                )
-                ok = True
-            except Exception:
+            claim = (
+                c.table("alarms")
+                .update({"status": "processing"})
+                .eq("id", alarm_id)
+                .eq("is_enabled", True)
+                .in_("status", ["scheduled", "failed"])
+                .lte("next_trigger_at", n)
+                .execute()
+            ).data or []
+            if not claim:
+                # Déjà traité par un autre tick concurrent.
                 continue
+        except Exception:
+            continue
+
+        notify_result = await notification_service.send_to_user_devices(
+            user_id,
+            title=title,
+            body=body,
+            data={"type": "alarm_due", "alarm_id": alarm_id, "user_id": user_id},
+            max_attempts=3,
+            c=c,
+        )
+        ok = bool(notify_result.get("successes"))
 
         if ok:
             sent += 1

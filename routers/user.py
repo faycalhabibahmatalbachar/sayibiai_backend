@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from core.deps import get_current_user_id
 from core.database import get_supabase_admin
 from core.responses import error_response, success_response
-from services import fcm_service
+from services import fcm_service, notification_service
 
 router = APIRouter(prefix="/user", tags=["user"])
 
@@ -28,7 +28,7 @@ class FcmTokenBody(BaseModel):
 
 
 class NotifyTestBody(BaseModel):
-    title: Optional[str] = "SAYIBI — test"
+    title: Optional[str] = "ChadGpt — test"
     body: Optional[str] = "Votre application a reçu une notification de test."
 
 
@@ -40,63 +40,6 @@ class ContextNotifyBody(BaseModel):
 
 def _db():
     return get_supabase_admin()
-
-
-def _log_notification(
-    c,
-    user_id: str,
-    *,
-    title: str,
-    body: str,
-    data: Optional[Dict[str, Any]],
-    message_id: Optional[str],
-) -> None:
-    try:
-        c.table("notifications").insert(
-            {
-                "user_id": user_id,
-                "title": title[:200],
-                "body": body[:1000],
-                "data": data or {},
-                "fcm_message_id": message_id,
-            }
-        ).execute()
-    except Exception:
-        pass
-
-
-def _load_device_tokens(c, user_id: str) -> List[str]:
-    tokens: List[str] = []
-    # New multi-device table (si présente)
-    try:
-        rows = (
-            c.table("fcm_device_tokens")
-            .select("token")
-            .eq("user_id", user_id)
-            .execute()
-        ).data or []
-        for r in rows:
-            t = (r or {}).get("token")
-            if isinstance(t, str) and t.strip():
-                tokens.append(t.strip())
-    except Exception:
-        pass
-    # Fallback token legacy
-    try:
-        row = (
-            c.table("users")
-            .select("fcm_token")
-            .eq("id", user_id)
-            .single()
-            .execute()
-        )
-        t = (row.data or {}).get("fcm_token") if row.data else None
-        if isinstance(t, str) and t.strip():
-            tokens.append(t.strip())
-    except Exception:
-        pass
-    # unique
-    return list(dict.fromkeys(tokens))
 
 
 @router.post("/fcm-token")
@@ -138,57 +81,24 @@ async def user_notify_test(body: NotifyTestBody, user_id: str = Depends(get_curr
     c = _db()
     if not c:
         return error_response("Base indisponible", 503)
-    tokens = _load_device_tokens(c, user_id)
+    tokens = notification_service.load_device_tokens(user_id, c)
     if not tokens:
         return error_response(
             "Aucun fcm_token enregistré — appelez d'abord POST /api/v1/user/fcm-token depuis l'app",
             400,
         )
-    title = (body.title or "SAYIBI — test").strip()
+    title = (body.title or "ChadGpt — test").strip()
     msg = (body.body or "Test").strip()
-    successes: List[Dict[str, Any]] = []
-    failures: List[Dict[str, str]] = []
-    for token in tokens:
-        sent = False
-        last_error = ""
-        for _ in range(3):
-            try:
-                result = await fcm_service.send_notification(
-                    token,
-                    title,
-                    msg,
-                    {"type": "sayibi_test", "user_id": user_id},
-                )
-                message_id = result.get("name") if isinstance(result, dict) else None
-                _log_notification(
-                    c,
-                    user_id,
-                    title=title,
-                    body=msg,
-                    data={"type": "sayibi_test", "user_id": user_id},
-                    message_id=message_id,
-                )
-                successes.append({"token_suffix": token[-8:], "name": message_id})
-                sent = True
-                break
-            except Exception as e:
-                last_error = str(e)
-        if not sent:
-            failures.append({"token_suffix": token[-8:], "error": last_error[:240]})
-            try:
-                c.table("notification_dlq").insert(
-                    {
-                        "user_id": user_id,
-                        "token_suffix": token[-8:],
-                        "title": title,
-                        "body": msg,
-                        "error_message": last_error[:500],
-                    }
-                ).execute()
-            except Exception:
-                pass
+    result = await notification_service.send_to_user_devices(
+        user_id,
+        title=title,
+        body=msg,
+        data={"type": "chadgpt_test", "user_id": user_id},
+        max_attempts=3,
+        c=c,
+    )
     return success_response(
-        {"successes": successes, "failures": failures},
+        result,
         "Notification traitée",
     )
 
@@ -201,42 +111,21 @@ async def user_notify_contextual(body: ContextNotifyBody, user_id: str = Depends
     c = _db()
     if not c:
         return error_response("Base indisponible", 503)
-    tokens = _load_device_tokens(c, user_id)
+    tokens = notification_service.load_device_tokens(user_id, c)
     if not tokens:
         return error_response("Aucun appareil enregistré", 400)
 
     payload_data = body.data or {}
-    successes: List[Dict[str, Any]] = []
-    failures: List[Dict[str, str]] = []
-    for token in tokens:
-        sent = False
-        last_error = ""
-        for _ in range(3):
-            try:
-                result = await fcm_service.send_notification(
-                    token,
-                    body.title,
-                    body.body,
-                    payload_data,
-                )
-                message_id = result.get("name") if isinstance(result, dict) else None
-                _log_notification(
-                    c,
-                    user_id,
-                    title=body.title,
-                    body=body.body,
-                    data=payload_data,
-                    message_id=message_id,
-                )
-                successes.append({"token_suffix": token[-8:], "name": message_id})
-                sent = True
-                break
-            except Exception as e:
-                last_error = str(e)
-        if not sent:
-            failures.append({"token_suffix": token[-8:], "error": last_error[:240]})
+    result = await notification_service.send_to_user_devices(
+        user_id,
+        title=body.title,
+        body=body.body,
+        data=payload_data,
+        max_attempts=3,
+        c=c,
+    )
     return success_response(
-        {"successes": successes, "failures": failures},
+        result,
         "Notification contextuelle traitée",
     )
 

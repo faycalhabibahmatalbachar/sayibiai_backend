@@ -127,7 +127,12 @@ async def synthesize(
             prefer_kokoro=False,
         )
     except Exception as e:
-        return error_response(str(e), 502)
+        msg = str(e)
+        if "ElevenLabs" in msg or "ELEVENLABS" in msg:
+            return error_response(msg, 502)
+        if "Aucun service TTS opérationnel" in msg:
+            return error_response(msg, 503)
+        return error_response(msg, 502)
     await log_usage(user_id, "/voice/synthesize", len(body.text), "tts")
     if raw:
         return Response(content=audio, media_type=mime)

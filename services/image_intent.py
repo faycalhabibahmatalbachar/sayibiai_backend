@@ -30,7 +30,7 @@ def should_use_image_generation_tool(
 ) -> bool:
     """
     True → appeler le moteur d’images (API Gemini), pas seulement le chat texte.
-    - Modèle « Sayibi · Images » : toujours (sauf génération de document).
+    - Modèle « ChadGpt · Images » : toujours (sauf génération de document).
     - Autres modèles (dont auto) : seulement si l’intention « créer une image » est détectée.
     """
     if document_creation_flow:

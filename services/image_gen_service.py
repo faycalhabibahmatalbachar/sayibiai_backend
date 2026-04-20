@@ -34,6 +34,7 @@ def finalize_prompt_for_image_generation(user_message: str) -> str:
 
 # Modèles testés côté Google AI Studio (génération native).
 _GEMINI_IMAGE_MODELS = (
+    "gemini-2.5-flash-image-preview",
     "gemini-2.0-flash-preview-image-generation",
     "gemini-2.0-flash-exp-image-generation",
     "gemini-2.0-flash-exp",
@@ -46,6 +47,58 @@ def _gemini_endpoint(model: str) -> str:
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={s.gemini_api_key}"
     )
+
+
+def _gemini_list_models_endpoint() -> str:
+    s = get_settings()
+    return f"https://generativelanguage.googleapis.com/v1beta/models?key={s.gemini_api_key}"
+
+
+def _normalize_model_name(name: str) -> str:
+    # Google ListModels returns names like "models/gemini-2.5-flash".
+    return name.split("/", 1)[1] if "/" in name else name
+
+
+async def _discover_gemini_image_models(client: httpx.AsyncClient) -> List[str]:
+    """Discover currently available Gemini models that can generate image output."""
+    try:
+        r = await client.get(_gemini_list_models_endpoint())
+        if r.status_code >= 400:
+            logger.warning("Gemini ListModels HTTP %s: %s", r.status_code, r.text[:300])
+            return []
+        payload = r.json()
+    except Exception as e:
+        logger.warning("Gemini ListModels failed: %s", e)
+        return []
+
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+
+    discovered: List[str] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        name_raw = m.get("name")
+        methods = m.get("supportedGenerationMethods") or m.get("supported_generation_methods") or []
+        if not isinstance(name_raw, str) or not isinstance(methods, list):
+            continue
+        if "generateContent" not in methods:
+            continue
+        lower = name_raw.lower()
+        # Heuristic: keep image-capable model families.
+        if ("image" not in lower) and ("imagen" not in lower):
+            continue
+        discovered.append(_normalize_model_name(name_raw))
+    return discovered
+
+
+def _ordered_unique_models(dynamic_models: List[str]) -> List[str]:
+    out: List[str] = []
+    for model in [*dynamic_models, *_GEMINI_IMAGE_MODELS]:
+        if model and model not in out:
+            out.append(model)
+    return out
 
 
 async def _try_gemini_native_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
@@ -63,7 +116,9 @@ async def _try_gemini_native_image(prompt: str) -> Tuple[Optional[bytes], Option
     }
 
     async with httpx.AsyncClient(timeout=180.0) as client:
-        for model in _GEMINI_IMAGE_MODELS:
+        dynamic_models = await _discover_gemini_image_models(client)
+        model_candidates = _ordered_unique_models(dynamic_models)
+        for model in model_candidates:
             try:
                 r = await client.post(_gemini_endpoint(model), json=body)
                 if r.status_code >= 400:

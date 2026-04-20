@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -12,7 +13,7 @@ from pydantic import ValidationError
 from core.config import get_settings
 from core.database import get_supabase_admin
 from models.agent import AgentStructuredResponse, AgentTurnRequest
-from services import groq_service
+from services import groq_service, mistral_service
 
 # Prompt condensé — aligné sur la spec SAYIBI Agent v2 (intentions, permissions, confirmation).
 AGENT_SYSTEM_PROMPT = """Tu es le moteur NLU et d'orchestration de SAYIBI AI pour actions natives (SMS, appels, agenda, etc.).
@@ -110,12 +111,15 @@ async def _contact_resolution_hints(user_id: str, query: str) -> str:
 async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStructuredResponse, Optional[int]]:
     """Un tour de conversation agent ; retourne (réponse structurée, tokens Groq si dispo)."""
     settings = get_settings()
-    if not settings.groq_api_key:
+    if not settings.groq_api_key and not settings.mistral_api_key:
         return (
             AgentStructuredResponse(
-                thinking="Groq non configuré",
+                thinking="Aucun provider NLU configuré",
                 action="error",
-                payload={"error_type": "configuration", "error_message": "GROQ_API_KEY manquant"},
+                payload={
+                    "error_type": "configuration",
+                    "error_message": "GROQ_API_KEY / MISTRAL_API_KEY manquant",
+                },
                 message_to_user="Le mode agent n'est pas disponible (configuration serveur).",
                 confidence=0.0,
             ),
@@ -152,34 +156,62 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
         {"role": "user", "content": user_content},
     ]
 
+    async def _groq_call(json_mode: bool):
+        return await groq_service.chat_completion(
+            messages,
+            temperature=0.2,
+            max_tokens=2048,
+            json_mode=json_mode,
+        )
+
+    async def _groq_with_retry(json_mode: bool):
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return await _groq_call(json_mode)
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                status = e.response.status_code if e.response is not None else None
+                # Backoff uniquement sur 429 / 5xx.
+                if status in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Groq indisponible")
+
+    async def _mistral_fallback() -> tuple[str, Optional[int]]:
+        if not settings.mistral_api_key:
+            raise RuntimeError("Mistral non configuré")
+        comp = await mistral_service.chat_completion(
+            messages,
+            model=mistral_service.DEFAULT_MODEL,
+        )
+        return mistral_service.extract_text_and_usage(comp)
+
     raw_text = ""
     tokens: Optional[int] = None
     try:
         try:
-            comp = await groq_service.chat_completion(
-                messages,
-                temperature=0.2,
-                max_tokens=2048,
-                json_mode=True,
-            )
-        except httpx.HTTPStatusError:
-            comp = await groq_service.chat_completion(
-                messages,
-                temperature=0.2,
-                max_tokens=2048,
-                json_mode=False,
-            )
-        raw_text, tokens = groq_service.extract_text_and_usage(comp)
+            comp = await _groq_with_retry(json_mode=True)
+            raw_text, tokens = groq_service.extract_text_and_usage(comp)
+        except httpx.HTTPStatusError as e:
+            # Groq peut renvoyer 429 ; fallback automatique Mistral pour éviter l'échec UI.
+            status = e.response.status_code if e.response is not None else None
+            if status in (429, 500, 502, 503, 504) and settings.mistral_api_key:
+                raw_text, tokens = await _mistral_fallback()
+            else:
+                comp = await _groq_with_retry(json_mode=False)
+                raw_text, tokens = groq_service.extract_text_and_usage(comp)
         return _parse_agent_json(raw_text), tokens
     except (json.JSONDecodeError, ValidationError):
         try:
-            comp = await groq_service.chat_completion(
-                messages,
-                temperature=0.1,
-                max_tokens=2048,
-                json_mode=False,
-            )
-            raw_text, tokens = groq_service.extract_text_and_usage(comp)
+            try:
+                comp = await _groq_with_retry(json_mode=False)
+                raw_text, tokens = groq_service.extract_text_and_usage(comp)
+            except Exception:
+                raw_text, tokens = await _mistral_fallback()
             return _parse_agent_json(raw_text), tokens
         except Exception as e2:
             return (
@@ -187,7 +219,7 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
                     thinking="Parse JSON échoué",
                     action="error",
                     payload={"error_type": "parse_error", "error_message": str(e2)},
-                    message_to_user="Je n'ai pas pu interpréter la réponse. Reformulez ou réessayez.",
+                    message_to_user="Le service est temporairement saturé. Réessayez dans quelques secondes.",
                     confidence=0.0,
                 ),
                 tokens,

@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import Response
 
+from core.config import get_settings
 from core.deps import get_current_user_id
 from core.responses import error_response, success_response
 from models.voice import SynthesizeRequest
@@ -34,6 +35,31 @@ def _safe_upstream_error_message(exc: httpx.HTTPStatusError) -> str:
         pass
     body = (response.text or "").strip()
     return body[:220] if body else "Erreur du service de transcription en amont"
+
+
+@router.get("/health")
+async def voice_health(user_id: str = Depends(get_current_user_id)):
+    """État live STT/TTS (Groq + ElevenLabs/Kokoro) pour diagnostic mobile."""
+    # user_id injecté pour garder endpoint protégé/authentifié.
+    _ = user_id
+    settings = get_settings()
+    providers = {
+        "stt_groq_configured": bool(settings.groq_api_key),
+        "tts_elevenlabs_configured": bool(settings.elevenlabs_api_key),
+        "tts_kokoro_configured": bool(settings.kokoro_tts_url),
+    }
+    eleven = {}
+    try:
+        eleven = await tts_service.elevenlabs_health_check()
+    except Exception as e:
+        eleven = {"ok": False, "configured": providers["tts_elevenlabs_configured"], "error": str(e)}
+    return success_response(
+        {
+            "providers": providers,
+            "elevenlabs": eleven,
+        },
+        "Voice health OK",
+    )
 
 
 @router.post("/transcribe")

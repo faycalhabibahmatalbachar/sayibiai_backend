@@ -49,7 +49,7 @@ async def sync_contacts(user_id: str, contacts: List[Dict[str, Any]]) -> Dict[st
     c = _db()
     if not c:
         return {"upserted": 0}
-    count = 0
+    rows: List[Dict[str, Any]] = []
     for contact in contacts:
         source_id = str(contact.get("contact_id") or contact.get("id") or "").strip()
         if not source_id:
@@ -70,7 +70,8 @@ async def sync_contacts(user_id: str, contacts: List[Dict[str, Any]]) -> Dict[st
                     "is_primary": bool(ph.get("is_primary", False)),
                 }
             )
-        payload = {
+        rows.append(
+            {
             "user_id": user_id,
             "source_contact_id": source_id,
             "display_name": display_name,
@@ -78,12 +79,24 @@ async def sync_contacts(user_id: str, contacts: List[Dict[str, Any]]) -> Dict[st
             "phones": normalized_phones,
             "last_seen_at": datetime.now(timezone.utc).isoformat(),
         }
+        )
+    if not rows:
+        return {"upserted": 0}
+    # Upsert par batch pour éviter des centaines d'appels HTTP individuels.
+    chunk_size = 250
+    upserted = 0
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
         try:
-            c.table("contact_identities").upsert(payload, on_conflict="user_id,source_contact_id").execute()
-            count += 1
+            c.table("contact_identities").upsert(
+                chunk,
+                on_conflict="user_id,source_contact_id",
+            ).execute()
+            upserted += len(chunk)
         except Exception:
+            # Fallback: ne pas bloquer toute la sync si un batch échoue.
             continue
-    return {"upserted": count}
+    return {"upserted": upserted}
 
 
 async def search_contacts(user_id: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:

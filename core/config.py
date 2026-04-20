@@ -69,6 +69,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"),
     )
     elevenlabs_api_key: str = ""
+    elevenlabs_default_voice_id: str = Field(
+        default="21m00Tcm4TlvDq8ikWAM",
+        validation_alias=AliasChoices(
+            "ELEVENLABS_DEFAULT_VOICE_ID",
+            "elevenlabs_default_voice_id",
+        ),
+    )
+    elevenlabs_model_id: str = Field(
+        default="eleven_multilingual_v2",
+        validation_alias=AliasChoices(
+            "ELEVENLABS_MODEL_ID",
+            "elevenlabs_model_id",
+        ),
+    )
     tavily_api_key: str = ""
     serper_api_key: str = Field(
         default="",

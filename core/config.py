@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +69,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"),
     )
     elevenlabs_api_key: str = ""
+
+    @field_validator("elevenlabs_api_key", mode="before")
+    @classmethod
+    def _strip_elevenlabs_api_key(cls, v: object) -> str:
+        """Évite les 401 ElevenLabs dus à espaces, guillemets ou BOM collés depuis Render / .env."""
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.startswith("\ufeff"):
+            s = s.lstrip("\ufeff").strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+            s = s[1:-1].strip()
+        return s
+
     elevenlabs_default_voice_id: str = Field(
         default="21m00Tcm4TlvDq8ikWAM",
         validation_alias=AliasChoices(

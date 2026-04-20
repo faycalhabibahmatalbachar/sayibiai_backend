@@ -21,7 +21,7 @@ AGENT_SYSTEM_PROMPT = """Tu es le moteur NLU et d'orchestration de ChadGpt pour 
 Règles critiques :
 0) Identité obligatoire : si l'utilisateur demande qui tu es, ton nom, ou qui t'a créé/développé, mets dans message_to_user exactement : « Je suis ChadGpt, un assistant créé par Faycal Habib Ahmat. » Ne te présente jamais comme ChatGPT, OpenAI, SAYIBI AI ou une autre marque ; tu es uniquement ChadGpt, créé par Faycal Habib Ahmat.
 1) Analyse l'intention et extrais les entités (contact_name, phone_number, message_content, time, location, urgency).
-2) Avant toute action sensible, vérifie les permissions nécessaires (contacts, sms, phone, calendar, camera, location). Si inconnu, utilise action "permission_needed" avec required_permissions.
+2) Permissions : le client envoie toujours « permission_state » JSON (clés contacts, sms, phone en booléen). Si une permission **requise** pour l’action est explicitement **false** dans ce JSON, réponds par « permission_needed » avec required_permissions (liste courte : sms, contacts, phone, …). Si les permissions nécessaires sont déjà **true** dans permission_state, **interdiction** de répondre « permission_needed » ou de dire seulement « vérification des permissions » — enchaîne tout de suite avec « search_contacts » (SMS/appel vers un prénom) ou « execute_action » si numéro et message sont connus.
 3) Envoi AUTO : n'exige jamais de confirmation explicite pour SMS / appel / email / suppression. Quand l'action est prête, réponds directement avec "execute_action".
 4) Ambiguïtés : plusieurs contacts → "clarify_contact" avec matches ; plusieurs numéros → "clarify_number". Aucun contact → "ask_missing_info".
 5) N'utilise la confirmation que pour gérer d'anciens états pending ; par défaut, exécute directement via "execute_action" dès que les champs requis sont présents.
@@ -95,6 +95,54 @@ def _force_auto_execute(resp: AgentStructuredResponse) -> AgentStructuredRespons
             "action": "execute_action",
             "payload": effective,
             "message_to_user": "Exécution automatique en cours.",
+        }
+    )
+
+
+def _norm_perm_key(x: str) -> str:
+    s = (x or "").lower().replace("-", "_").strip()
+    if s in ("send_sms", "sms", "read_sms"):
+        return "sms"
+    if s in ("read_contacts", "contacts", "contact"):
+        return "contacts"
+    if s in ("phone", "call", "read_phone_state", "telephone"):
+        return "phone"
+    return s
+
+
+def _coerce_permission_needed_when_granted(
+    body: AgentTurnRequest, resp: AgentStructuredResponse
+) -> AgentStructuredResponse:
+    """Si le LLM bloque sur permission_needed alors que le client signale déjà les droits OK."""
+    if resp.action != "permission_needed":
+        return resp
+    ps = body.permission_state or {}
+    if not ps:
+        return resp
+    pl = resp.payload if isinstance(resp.payload, dict) else {}
+    req_raw = pl.get("required_permissions") or []
+    if not isinstance(req_raw, list):
+        req_raw = []
+    keys = [_norm_perm_key(str(x)) for x in req_raw if x]
+    if not keys:
+        keys = ["contacts", "sms"]
+    skip = {"calendar", "camera", "location", "storage", "photos", "microphone"}
+    for k in keys:
+        if k in skip:
+            return resp
+        if k not in ("contacts", "sms", "phone"):
+            return resp
+        if not ps.get(k):
+            return resp
+    q = _hint_query_from_body(body).strip()
+    if not q:
+        q = body.message.strip()[:120]
+    return resp.model_copy(
+        update={
+            "action": "search_contacts",
+            "payload": {"query": q},
+            "message_to_user": "Recherche du contact en cours…",
+            "thinking": (resp.thinking or "").strip() + " [permissions déjà OK → search_contacts]",
         }
     )
 
@@ -242,7 +290,8 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
             else:
                 comp = await _groq_with_retry(json_mode=False)
                 raw_text, tokens = groq_service.extract_text_and_usage(comp)
-        return _force_auto_execute(_parse_agent_json(raw_text)), tokens
+        parsed = _force_auto_execute(_parse_agent_json(raw_text))
+        return _coerce_permission_needed_when_granted(body, parsed), tokens
     except (json.JSONDecodeError, ValidationError):
         try:
             try:
@@ -250,7 +299,8 @@ async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStr
                 raw_text, tokens = groq_service.extract_text_and_usage(comp)
             except Exception:
                 raw_text, tokens = await _mistral_fallback()
-            return _force_auto_execute(_parse_agent_json(raw_text)), tokens
+            parsed = _force_auto_execute(_parse_agent_json(raw_text))
+            return _coerce_permission_needed_when_granted(body, parsed), tokens
         except Exception as e2:
             return (
                 AgentStructuredResponse(

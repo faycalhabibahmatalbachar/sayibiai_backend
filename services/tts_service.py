@@ -1,5 +1,6 @@
 """Synthèse vocale — ElevenLabs, Kokoro (HTTP), ou repli message."""
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -12,6 +13,28 @@ ELEVENLABS_BUILTIN_VOICES: Dict[str, str] = {
     "mariam": "tMyQcCxfGDdIt7wJ2RQw",
     "hassane": "c365oriviHmAhyLhpuN6",
 }
+
+def _elevenlabs_upstream_detail(response: Optional[httpx.Response]) -> str:
+    if response is None:
+        return ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            err = payload.get("detail")
+            if isinstance(err, dict):
+                msg = err.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    return msg.strip()[:300]
+            if isinstance(err, str) and err.strip():
+                return err.strip()[:300]
+            msg = payload.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()[:300]
+    except (ValueError, json.JSONDecodeError):
+        pass
+    t = (response.text or "").strip()
+    return t[:300] if t else ""
+
 
 class TtsProviderError(RuntimeError):
     def __init__(self, provider: str, message: str, status_code: Optional[int] = None):
@@ -104,11 +127,16 @@ async def synthesize_elevenlabs(
                 r2.raise_for_status()
                 return r2.content
             if status == 401:
-                raise TtsProviderError(
-                    "elevenlabs",
-                    "ELEVENLABS_API_KEY invalide ou expirée (401 Unauthorized)",
-                    status_code=401,
-                ) from e
+                detail = _elevenlabs_upstream_detail(e.response)
+                base = "ElevenLabs a refusé la clé API (401)."
+                if detail:
+                    msg = f"{base} Détail: {detail}"
+                else:
+                    msg = (
+                        f"{base} Vérifiez ELEVENLABS_API_KEY sur Render (copie sans espace, "
+                        "clé « API Key » du profil ElevenLabs, pas un autre identifiant)."
+                    )
+                raise TtsProviderError("elevenlabs", msg, status_code=401) from e
             raise TtsProviderError(
                 "elevenlabs",
                 f"Erreur ElevenLabs HTTP {status or 'inconnue'}",
@@ -178,10 +206,11 @@ async def synthesize(
             return data, "audio/mpeg"
 
     joined = "; ".join(errors)
-    if "401 Unauthorized" in joined or "invalide ou expirée" in joined:
+    if "401 Unauthorized" in joined or "refusé la clé" in joined or "invalide ou expirée" in joined:
         raise RuntimeError(
-            "Synthèse vocale indisponible: clé ElevenLabs invalide/expirée. "
-            "Mettez à jour ELEVENLABS_API_KEY ou configurez KOKORO_TTS_URL."
+            "Synthèse vocale ElevenLabs indisponible (401). "
+            "Vérifiez ELEVENLABS_API_KEY sur Render (valeur exacte de la clé API, sans guillemets ni espace). "
+            "Sinon configurez KOKORO_TTS_URL."
         )
     detail = f" ({joined})" if errors else ""
     raise RuntimeError("Aucun service TTS opérationnel (ElevenLabs/Kokoro)" + detail)

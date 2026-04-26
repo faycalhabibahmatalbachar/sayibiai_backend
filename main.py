@@ -17,6 +17,7 @@ from middleware.user_context import UserContextMiddleware
 from services import fcm_service
 from routers import alarm, agent, agent_actions, auth, chat, documents, generate, image, internal, omni, search, user, voice
 from routers import media, social, surveillance, avatar, files, proactivity
+from routers import admin as admin_router
 
 
 @asynccontextmanager
@@ -89,6 +90,8 @@ app.include_router(surveillance.router, prefix=f"{API}")
 app.include_router(avatar.router, prefix=f"{API}")
 app.include_router(files.router, prefix=f"{API}")
 app.include_router(proactivity.router, prefix=f"{API}")
+# Admin console — panel d'administration entreprise
+app.include_router(admin_router.router, prefix=f"{API}")
 
 
 @app.get("/health")

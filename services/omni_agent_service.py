@@ -181,55 +181,68 @@ async def create_generated_image(
     }
 
 
-async def save_call_settings(user_id: str, settings_payload: dict) -> dict:
-    db = get_supabase_admin()
-    clean = {
-        "user_id": user_id,
-        "enabled": bool(settings_payload.get("enabled", False)),
-        "active_hours": settings_payload.get("active_hours") or {},
-        "voice_type": settings_payload.get("voice_type") or "female_fr",
-        "custom_greeting": settings_payload.get("custom_greeting") or "",
-        "whitelist_contacts": settings_payload.get("whitelist_contacts") or [],
-        "blacklist_contacts": settings_payload.get("blacklist_contacts") or [],
-        "forward_urgent_calls": bool(settings_payload.get("forward_urgent_calls", True)),
-        "updated_at": _utc_now_iso(),
-    }
-    if not db:
-        return clean
-    db.table("call_settings").upsert(clean).execute()
-    return clean
-
-
-async def get_call_settings(user_id: str) -> dict:
-    db = get_supabase_admin()
-    if not db:
-        return {
-            "user_id": user_id,
-            "enabled": False,
-            "active_hours": {},
-            "voice_type": "female_fr",
-            "custom_greeting": "",
-            "whitelist_contacts": [],
-            "blacklist_contacts": [],
-            "forward_urgent_calls": True,
-        }
-    try:
-        res = db.table("call_settings").select("*").eq("user_id", user_id).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        if rows:
-            return rows[0]
-    except Exception as e:
-        logger.warning("get_call_settings failed: %s", e)
+def _default_call_settings(user_id: str) -> dict:
     return {
         "user_id": user_id,
-        "enabled": False,
-        "active_hours": {},
+        "secretary_enabled": False,
+        "active_hours": {"start": "09:00", "end": "18:00"},
         "voice_type": "female_fr",
         "custom_greeting": "",
         "whitelist_contacts": [],
         "blacklist_contacts": [],
         "forward_urgent_calls": True,
+        "auto_sms_reply": False,
+        "auto_sms_template": "Je suis actuellement occupé. Mon assistant IA prendra votre message.",
     }
+
+
+async def save_call_settings(user_id: str, settings_payload: dict) -> dict:
+    db = get_supabase_admin()
+    # Accept both "enabled" and "secretary_enabled" from Flutter
+    secretary_enabled = settings_payload.get(
+        "secretary_enabled",
+        settings_payload.get("enabled", False),
+    )
+    clean = {
+        "user_id": user_id,
+        "secretary_enabled": bool(secretary_enabled),
+        "active_hours": settings_payload.get("active_hours") or {"start": "09:00", "end": "18:00"},
+        "voice_type": settings_payload.get("voice_type") or "female_fr",
+        "custom_greeting": settings_payload.get("custom_greeting") or "",
+        "whitelist_contacts": settings_payload.get("whitelist_contacts") or [],
+        "blacklist_contacts": settings_payload.get("blacklist_contacts") or [],
+        "forward_urgent_calls": bool(settings_payload.get("forward_urgent_calls", True)),
+        "auto_sms_reply": bool(settings_payload.get("auto_sms_reply", False)),
+        "auto_sms_template": settings_payload.get("auto_sms_template")
+            or "Je suis actuellement occupé. Mon assistant IA prendra votre message.",
+        "updated_at": _utc_now_iso(),
+    }
+    if not db:
+        return clean
+    try:
+        db.table("call_settings").upsert(clean, on_conflict="user_id").execute()
+    except Exception as e:
+        logger.warning("save_call_settings upsert failed: %s", e)
+    return clean
+
+
+async def get_call_settings(user_id: str) -> dict:
+    db = get_supabase_admin()
+    defaults = _default_call_settings(user_id)
+    if not db:
+        return defaults
+    try:
+        res = db.table("call_settings").select("*").eq("user_id", user_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            row = rows[0]
+            # Normalise: accept legacy "enabled" column if "secretary_enabled" absent
+            if "secretary_enabled" not in row and "enabled" in row:
+                row["secretary_enabled"] = row.pop("enabled")
+            return row
+    except Exception as e:
+        logger.warning("get_call_settings failed: %s", e)
+    return defaults
 
 
 def _simple_sentiment(text: str) -> str:

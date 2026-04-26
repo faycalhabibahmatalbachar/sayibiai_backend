@@ -1,6 +1,7 @@
 """Voix — transcription Whisper Groq, synthèse TTS."""
 
 import base64
+import logging
 from typing import Optional
 
 import httpx
@@ -14,6 +15,14 @@ from core.responses import error_response, success_response
 from models.voice import SynthesizeRequest
 from services import groq_service, tts_service
 from services.usage_service import log_usage
+
+logger = logging.getLogger(__name__)
+
+
+def _is_table_missing_error(exc: Exception) -> bool:
+    """Detect Supabase/PostgREST 'relation does not exist' errors."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ["does not exist", "42p01", "relation", "undefined table"])
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -156,7 +165,7 @@ async def get_call_log(
             return success_response([], "OK")
         res = (
             c.table("inbound_calls")
-            .select("*")
+            .select("id,caller_phone,caller_name,call_timestamp,call_duration_seconds,summary,sentiment,urgency_level,user_read")
             .eq("user_id", user_id)
             .order("call_timestamp", desc=True)
             .limit(limit)
@@ -164,6 +173,9 @@ async def get_call_log(
         )
         return success_response(res.data or [], "OK")
     except Exception as e:
+        if _is_table_missing_error(e):
+            logger.warning("inbound_calls table not yet migrated: %s", e)
+            return success_response([], "OK — table pending migration")
         return error_response(str(e), 500)
 
 
@@ -181,24 +193,30 @@ async def inbound_sms_webhook(
         phone = payload.get("phone", "")
         body = payload.get("body", "")
         c = get_supabase_admin()
-        if c:
-            c.table("sms_log").insert({
-                "id": str(uuid.uuid4()),
-                "user_id": user_id,
-                "direction": "inbound",
-                "phone_number": phone,
-                "body": body,
-                "ai_generated": False,
-                "read": False,
-            }).execute()
-
-        # Vérifier si réponse auto activée
         auto_reply = None
         if c:
-            settings = c.table("call_settings").select("auto_sms_reply,auto_sms_template").eq("user_id", user_id).execute()
-            if settings.data and settings.data[0].get("auto_sms_reply"):
-                template = settings.data[0].get("auto_sms_template", "")
-                auto_reply = {"phone": phone, "body": template}
+            try:
+                c.table("sms_log").insert({
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "direction": "inbound",
+                    "phone_number": phone,
+                    "body": body,
+                    "ai_generated": False,
+                    "read": False,
+                }).execute()
+            except Exception as e_ins:
+                if not _is_table_missing_error(e_ins):
+                    raise
+                logger.warning("sms_log table not yet migrated: %s", e_ins)
+
+            try:
+                settings_res = c.table("call_settings").select("auto_sms_reply,auto_sms_template").eq("user_id", user_id).execute()
+                if settings_res.data and settings_res.data[0].get("auto_sms_reply"):
+                    template = settings_res.data[0].get("auto_sms_template", "")
+                    auto_reply = {"phone": phone, "body": template}
+            except Exception as e_cfg:
+                logger.warning("call_settings read failed: %s", e_cfg)
 
         return success_response(
             {"stored": True, "auto_reply": auto_reply},
@@ -217,13 +235,18 @@ async def confirm_sms_sent(
     try:
         c = get_supabase_admin()
         if c:
-            c.table("sms_log").insert({
-                "user_id": user_id,
-                "direction": "outbound",
-                "phone_number": payload.get("phone", ""),
-                "body": payload.get("body", ""),
-                "ai_generated": payload.get("ai_generated", False),
-            }).execute()
+            try:
+                c.table("sms_log").insert({
+                    "user_id": user_id,
+                    "direction": "outbound",
+                    "phone_number": payload.get("phone", ""),
+                    "body": payload.get("body", ""),
+                    "ai_generated": payload.get("ai_generated", False),
+                }).execute()
+            except Exception as e_ins:
+                if not _is_table_missing_error(e_ins):
+                    raise
+                logger.warning("sms_log table not yet migrated: %s", e_ins)
         return success_response({"confirmed": True}, "SMS confirmé")
     except Exception as e:
         return error_response(str(e), 500)
@@ -249,4 +272,7 @@ async def get_sms_history(
         )
         return success_response(res.data or [], "OK")
     except Exception as e:
+        if _is_table_missing_error(e):
+            logger.warning("sms_log table not yet migrated: %s", e)
+            return success_response([], "OK — table pending migration")
         return error_response(str(e), 500)

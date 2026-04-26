@@ -1,0 +1,64 @@
+# Web
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-dotenv==1.0.0
+# Aligné avec supabase>=2.4 (ex. 2.28.x impose httpx>=0.26,<0.29).
+httpx==0.28.1
+# 2.5.x n’a pas de wheel pydantic-core pour Python 3.13 → build Rust requis ; >=2.10 fournit cp313.
+pydantic==2.11.10
+pydantic-settings==2.11.0
+python-multipart==0.0.6
+
+# Supabase
+supabase==2.28.3
+# realtime (transitif) importe `websockets.asyncio` ; websockets 12.x ne l’expose pas — >=14,<16 (contrainte realtime).
+websockets>=14.0,<16.0
+
+# Redis
+redis==5.0.1
+
+# LLM / IA
+anthropic==0.18.0
+openai==1.10.0
+
+# Documents
+# PyMuPDF 1.23.x compile MuPDF depuis les sources sur Windows sans wheel cp313 → VS requis.
+# >=1.24.14 fournit des wheels pour Python 3.13 (win_amd64) — pas de compilation locale.
+PyMuPDF==1.26.7
+python-docx==1.1.0
+reportlab==4.0.9
+openpyxl==3.1.2
+python-pptx==0.6.23
+Pillow==10.4.0
+
+# Vecteurs (paquet officiel renommé : pinecone, plus pinecone-client)
+pinecone==5.4.2
+
+# Storage S3-compatible (R2)
+boto3==1.34.34
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+google-auth==2.27.0
+
+# Utils
+requests==2.31.0
+aiofiles==23.2.1
+python-magic==0.4.27
+langdetect==1.0.9
+# Ancien paquet duckduckgo_search → ddgs ; 6.x retiré de PyPI pour cp313 (voir versions 9.x).
+ddgs==9.14.0
+email-validator==2.1.0
+
+# Celery — tâches asynchrones et planification
+celery[redis]==5.3.6
+celery[beat]
+
+# Chiffrement AES pour tokens OAuth
+cryptography==42.0.5
+
+# Génération vidéo et traitement
+moviepy==1.0.3
+opencv-python-headless==4.9.0.80
+ffmpeg-python==0.2.0

@@ -1,0 +1,325 @@
+"""NLU mode agent : réponse JSON structurée (Groq) + indices d’apprentissage Supabase."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+import httpx
+from pydantic import ValidationError
+
+from core.config import get_settings
+from core.database import get_supabase_admin
+from models.agent import AgentStructuredResponse, AgentTurnRequest
+from services import groq_service, mistral_service
+
+# Prompt condensé — mode agent ChadGpt (intentions, permissions, exécution auto).
+AGENT_SYSTEM_PROMPT = """Tu es le moteur NLU et d'orchestration de ChadGpt pour actions natives (SMS, appels, agenda, etc.).
+
+Règles critiques :
+0) Identité obligatoire : si l'utilisateur demande qui tu es, ton nom, ou qui t'a créé/développé, mets dans message_to_user exactement : « Je suis ChadGpt, un assistant créé par Faycal Habib Ahmat. » Ne te présente jamais comme ChatGPT, OpenAI, SAYIBI AI ou une autre marque ; tu es uniquement ChadGpt, créé par Faycal Habib Ahmat.
+1) Analyse l'intention et extrais les entités (contact_name, phone_number, message_content, time, location, urgency).
+2) Permissions : le client envoie toujours « permission_state » JSON (clés contacts, sms, phone en booléen). Si une permission **requise** pour l’action est explicitement **false** dans ce JSON, réponds par « permission_needed » avec required_permissions (liste courte : sms, contacts, phone, …). Si les permissions nécessaires sont déjà **true** dans permission_state, **interdiction** de répondre « permission_needed » ou de dire seulement « vérification des permissions » — enchaîne tout de suite avec « search_contacts » (SMS/appel vers un prénom) ou « execute_action » si numéro et message sont connus.
+3) Envoi AUTO : n'exige jamais de confirmation explicite pour SMS / appel / email / suppression. Quand l'action est prête, réponds directement avec "execute_action".
+4) Ambiguïtés : plusieurs contacts → "clarify_contact" avec matches ; plusieurs numéros → "clarify_number". Aucun contact → "ask_missing_info".
+5) N'utilise la confirmation que pour gérer d'anciens états pending ; par défaut, exécute directement via "execute_action" dès que les champs requis sont présents.
+6) Si le client a fourni contact_search_results, utilise-les pour décider (ne invente pas de contacts).
+7) message_to_user : français naturel, court. Masque partiellement les numéros dans les messages utilisateur (+235 6 12 ••• •• 78).
+8) Les outils réels sont côté client ; si tu as besoin de données contacts, réponds par action "search_contacts" avec payload.query (le client renverra les résultats au tour suivant).
+9) Pour les médias locaux du téléphone: utilise "search_local_media" avec payload.query (et éventuellement payload.media_type=image|video). Pour ouvrir un élément choisi: "open_local_media" avec payload.path.
+10) Pour le gestionnaire de fichiers (PDF, DOC, ZIP, audio, etc.): utilise "search_local_files" avec payload.query (et payload.kind=any|document|audio|video|image|archive|file). Pour ouvrir: "open_local_file" avec payload.path.
+11) Ne retourne jamais "confirm_needed". Utilise "execute_action" dès que l'action est déterminée.
+
+Valeurs autorisées pour "action" (string) :
+search_contacts | get_contact_details | send_sms | make_call | send_email | send_whatsapp |
+create_event | search_events | update_event | delete_event | create_reminder | set_alarm | update_alarm | delete_alarm | view_alarms |
+check_permission | request_permission | open_app | take_photo | get_location | search_local_media | open_local_media | search_local_files | open_local_file |
+web_search | open_map | get_directions |
+clarify_contact | clarify_number | ask_missing_info |
+permission_needed | alternative_suggested | execute_action | cancelled |
+log_action | error | rate_limit_exceeded
+
+Tu réponds UNIQUEMENT par un objet JSON valide avec exactement ces clés :
+thinking, action, payload, next_steps, message_to_user, confidence, ambiguities
+- payload : objet (peut être vide)
+- next_steps : tableau de strings
+- ambiguities : tableau (strings ou objets courts)
+- confidence : nombre entre 0 et 1
+"""
+
+
+def _strip_json_fence(text: str) -> str:
+    t = text.strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t)
+    if m:
+        return m.group(1).strip()
+    return t
+
+
+def _parse_agent_json(raw: str) -> AgentStructuredResponse:
+    cleaned = _strip_json_fence(raw)
+    data = json.loads(cleaned)
+    return AgentStructuredResponse.model_validate(data)
+
+
+def _force_auto_execute(resp: AgentStructuredResponse) -> AgentStructuredResponse:
+    """Convertit tout confirm_needed résiduel en execute_action."""
+    if resp.action != "confirm_needed":
+        return resp
+
+    payload = dict(resp.payload or {})
+    effective = payload
+    if isinstance(payload.get("pending"), dict):
+        pending = dict(payload.get("pending") or {})
+        pending_payload = pending.get("payload")
+        if isinstance(pending_payload, dict):
+            effective = dict(pending_payload)
+            if "action_type" not in effective and "action" in pending:
+                effective["action_type"] = str(pending.get("action") or "").strip()
+        else:
+            effective = pending
+
+    if "action_type" not in effective and "type" in effective:
+        effective["action_type"] = str(effective.get("type") or "").strip()
+    if "action_type" not in effective and "action" in effective:
+        effective["action_type"] = str(effective.get("action") or "").strip()
+
+    if not (effective.get("action_type") or "").strip():
+        # Fallback minimal pour laisser le client tracer l'échec proprement.
+        effective["action_type"] = "execute"
+
+    return resp.model_copy(
+        update={
+            "action": "execute_action",
+            "payload": effective,
+            "message_to_user": "Exécution automatique en cours.",
+        }
+    )
+
+
+def _norm_perm_key(x: str) -> str:
+    s = (x or "").lower().replace("-", "_").strip()
+    if s in ("send_sms", "sms", "read_sms"):
+        return "sms"
+    if s in ("read_contacts", "contacts", "contact"):
+        return "contacts"
+    if s in ("phone", "call", "read_phone_state", "telephone"):
+        return "phone"
+    return s
+
+
+def _coerce_permission_needed_when_granted(
+    body: AgentTurnRequest, resp: AgentStructuredResponse
+) -> AgentStructuredResponse:
+    """Si le LLM bloque sur permission_needed alors que le client signale déjà les droits OK."""
+    if resp.action != "permission_needed":
+        return resp
+    ps = body.permission_state or {}
+    if not ps:
+        return resp
+    pl = resp.payload if isinstance(resp.payload, dict) else {}
+    req_raw = pl.get("required_permissions") or []
+    if not isinstance(req_raw, list):
+        req_raw = []
+    keys = [_norm_perm_key(str(x)) for x in req_raw if x]
+    if not keys:
+        keys = ["contacts", "sms"]
+    skip = {"calendar", "camera", "location", "storage", "photos", "microphone"}
+    for k in keys:
+        if k in skip:
+            return resp
+        if k not in ("contacts", "sms", "phone"):
+            return resp
+        if not ps.get(k):
+            return resp
+    q = _hint_query_from_body(body).strip()
+    if not q:
+        q = body.message.strip()[:120]
+    return resp.model_copy(
+        update={
+            "action": "search_contacts",
+            "payload": {"query": q},
+            "message_to_user": "Recherche du contact en cours…",
+            "thinking": (resp.thinking or "").strip() + " [permissions déjà OK → search_contacts]",
+        }
+    )
+
+
+def _hint_query_from_body(body: AgentTurnRequest) -> str:
+    if body.pending and isinstance(body.pending, dict):
+        pl = body.pending.get("payload")
+        if isinstance(pl, dict):
+            for k in ("query", "contact_name"):
+                v = pl.get(k)
+                if v:
+                    return str(v).strip().lower()[:200]
+    return body.message.strip().lower()[:200]
+
+
+async def _contact_resolution_hints(user_id: str, query: str) -> str:
+    """Résumé textuel des choix passés pour une requête (ex. prénom)."""
+    c = get_supabase_admin()
+    if not c or not query.strip():
+        return ""
+    qn = query.strip().lower()[:200]
+    try:
+        res = (
+            c.table("contact_resolutions")
+            .select("contact_id_chosen, display_name_snapshot")
+            .eq("user_id", user_id)
+            .eq("query", qn)
+            .order("created_at", desc=True)
+            .limit(40)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return ""
+        from collections import Counter
+
+        keys = [r["contact_id_chosen"] for r in rows]
+        cnt = Counter(keys)
+        top = cnt.most_common(3)
+        parts = []
+        for cid, n in top:
+            name = next(
+                (r.get("display_name_snapshot") for r in rows if r["contact_id_chosen"] == cid),
+                cid,
+            )
+            parts.append(f"{name or cid} (×{n})")
+        return "Préférences enregistrées pour cette requête : " + ", ".join(parts) + ". Privilégier ces contacts si pertinent."
+    except Exception:
+        return ""
+
+
+async def run_agent_turn(user_id: str, body: AgentTurnRequest) -> tuple[AgentStructuredResponse, Optional[int]]:
+    """Un tour de conversation agent ; retourne (réponse structurée, tokens Groq si dispo)."""
+    settings = get_settings()
+    if not settings.groq_api_key and not settings.mistral_api_key:
+        return (
+            AgentStructuredResponse(
+                thinking="Aucun provider NLU configuré",
+                action="error",
+                payload={
+                    "error_type": "configuration",
+                    "error_message": "GROQ_API_KEY / MISTRAL_API_KEY manquant",
+                },
+                message_to_user="Le mode agent n'est pas disponible (configuration serveur).",
+                confidence=0.0,
+            ),
+            None,
+        )
+
+    hint_query = _hint_query_from_body(body)
+    hints = await _contact_resolution_hints(user_id, hint_query)
+
+    ctx_parts: List[str] = []
+    if body.pending:
+        ctx_parts.append("État pending (JSON) :\n" + json.dumps(body.pending, ensure_ascii=False))
+    if body.contact_search_results is not None:
+        ctx_parts.append(
+            "Résultats search_contacts (JSON) :\n"
+            + json.dumps(body.contact_search_results, ensure_ascii=False)[:12000]
+        )
+    if body.permission_state:
+        ctx_parts.append("Permissions client :\n" + json.dumps(body.permission_state, ensure_ascii=False))
+    if body.memory_context:
+        ctx_parts.append(
+            "Mémoire client (historique des actions précédentes) :\n"
+            + body.memory_context.strip()[:8000]
+        )
+    if hints:
+        ctx_parts.append(hints)
+
+    user_content = body.message.strip()
+    if ctx_parts:
+        user_content = "\n\n".join(ctx_parts) + "\n\n---\nMessage utilisateur :\n" + user_content
+
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    async def _groq_call(json_mode: bool):
+        return await groq_service.chat_completion(
+            messages,
+            temperature=0.2,
+            max_tokens=2048,
+            json_mode=json_mode,
+        )
+
+    async def _groq_with_retry(json_mode: bool):
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return await _groq_call(json_mode)
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                status = e.response.status_code if e.response is not None else None
+                # Backoff uniquement sur 429 / 5xx.
+                if status in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Groq indisponible")
+
+    async def _mistral_fallback() -> tuple[str, Optional[int]]:
+        if not settings.mistral_api_key:
+            raise RuntimeError("Mistral non configuré")
+        comp = await mistral_service.chat_completion(
+            messages,
+            model=mistral_service.DEFAULT_MODEL,
+        )
+        return mistral_service.extract_text_and_usage(comp)
+
+    raw_text = ""
+    tokens: Optional[int] = None
+    try:
+        try:
+            comp = await _groq_with_retry(json_mode=True)
+            raw_text, tokens = groq_service.extract_text_and_usage(comp)
+        except httpx.HTTPStatusError as e:
+            # Groq peut renvoyer 429 ; fallback automatique Mistral pour éviter l'échec UI.
+            status = e.response.status_code if e.response is not None else None
+            if status in (429, 500, 502, 503, 504) and settings.mistral_api_key:
+                raw_text, tokens = await _mistral_fallback()
+            else:
+                comp = await _groq_with_retry(json_mode=False)
+                raw_text, tokens = groq_service.extract_text_and_usage(comp)
+        parsed = _force_auto_execute(_parse_agent_json(raw_text))
+        return _coerce_permission_needed_when_granted(body, parsed), tokens
+    except (json.JSONDecodeError, ValidationError):
+        try:
+            try:
+                comp = await _groq_with_retry(json_mode=False)
+                raw_text, tokens = groq_service.extract_text_and_usage(comp)
+            except Exception:
+                raw_text, tokens = await _mistral_fallback()
+            parsed = _force_auto_execute(_parse_agent_json(raw_text))
+            return _coerce_permission_needed_when_granted(body, parsed), tokens
+        except Exception as e2:
+            return (
+                AgentStructuredResponse(
+                    thinking="Parse JSON échoué",
+                    action="error",
+                    payload={"error_type": "parse_error", "error_message": str(e2)},
+                    message_to_user="Le service est temporairement saturé. Réessayez dans quelques secondes.",
+                    confidence=0.0,
+                ),
+                tokens,
+            )
+    except Exception as e:
+        return (
+            AgentStructuredResponse(
+                thinking=str(e),
+                action="error",
+                payload={"error_type": "agent_failure", "error_message": str(e)},
+                message_to_user="Une erreur est survenue. Réessayez dans un instant.",
+                confidence=0.0,
+            ),
+            None,
+        )

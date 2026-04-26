@@ -1,0 +1,2 @@
+# Dépendances optionnelles pour scripts de test (en plus de requirements.txt)
+rich==13.7.0

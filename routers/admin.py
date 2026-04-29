@@ -38,6 +38,9 @@ async def get_admin_user(
     settings = get_settings()
     sub = get_subject_from_token(credentials.credentials)
     if not sub:
+        logger.warning(
+            "Admin auth: Bearer présent mais subject absent (JWT invalide, expiré ou type incorrect)"
+        )
         raise HTTPException(status_code=401, detail="Token admin invalide ou expiré")
 
     db = get_supabase_admin()

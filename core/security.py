@@ -1,5 +1,6 @@
 """JWT — création et vérification des tokens d'accès et de rafraîchissement."""
 
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -7,6 +8,11 @@ from typing import Any, Dict, Optional
 from jose import JWTError, jwt
 
 from core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# Jetons utilisateur: type "access". Jetons admin: extra_claims met "admin_access" (voir routers/admin.py).
+_ACCESS_JWT_TYPES = frozenset({"access", "admin_access"})
 
 
 def create_access_token(
@@ -52,7 +58,13 @@ def get_subject_from_token(token: str) -> Optional[str]:
     try:
         payload = decode_token(token)
         sub = payload.get("sub")
-        if payload.get("type") != "access":
+        token_type = payload.get("type")
+        if token_type not in _ACCESS_JWT_TYPES:
+            logger.info(
+                "JWT: type non autorisé pour extraction du subject (type=%r, sub_present=%s)",
+                token_type,
+                sub is not None,
+            )
             return None
         return str(sub) if sub is not None else None
     except JWTError:

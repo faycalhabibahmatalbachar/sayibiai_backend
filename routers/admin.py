@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 _bearer = HTTPBearer(auto_error=False)
 
+
+def _unwrap_rpc_jsonb(payload: Any) -> Dict[str, Any]:
+    """Normalise la réponse PostgREST d'un RPC JSONB (souvent `[{ fn_...: {...} }]`)."""
+    if payload is None:
+        return {}
+    if isinstance(payload, dict) and ("stages" in payload or "period_days" in payload):
+        return payload
+    if isinstance(payload, list) and len(payload) > 0:
+        row = payload[0]
+        if not isinstance(row, dict):
+            return {}
+        for _k, val in row.items():
+            if isinstance(val, dict) and ("stages" in val or "period_days" in val):
+                return val
+        return row
+    return {}
+
+
 # ─── Admin Auth Dependency ────────────────────────────────────────────────────
 
 async def get_admin_user(
@@ -522,13 +540,14 @@ async def analytics_daily(
     days: int = Query(30, ge=1, le=365),
     admin: Dict = Depends(get_admin_user),
 ):
-    """Statistiques journalières: requêtes, utilisateurs, tokens, erreurs."""
+    """Statistiques journalières: requêtes, utilisateurs actifs distincts, tokens, erreurs (fn_daily_stats)."""
     db = _db()
     if not db:
         return error_response("Base indisponible", 503)
     try:
-        res = db.table("v_daily_stats").select("*").limit(days).execute()
-        return success_response({"data": res.data or [], "days": days})
+        res = db.rpc("fn_daily_stats", {"p_days": days}).execute()
+        rows = res.data or []
+        return success_response({"data": rows, "days": days})
     except Exception as e:
         logger.error("analytics_daily error: %s", e)
         return error_response(str(e), 500)
@@ -553,32 +572,19 @@ async def analytics_cohorts(
 
 @router.get("/analytics/funnel")
 async def analytics_funnel(
-    days: int = Query(30, ge=1, le=90),
+    days: int = Query(30, ge=1, le=366),
     admin: Dict = Depends(get_admin_user),
 ):
-    """Funnel de conversion: nouveaux users, sessions, messages, tokens."""
+    """Funnel de conversion (SQL fn_analytics_funnel — utilisateurs distincts)."""
     db = _db()
     if not db:
         return error_response("Base indisponible", 503)
     try:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-
-        total_users = (db.table("users").select("id", count="exact").execute()).count or 0
-        new_users = (db.table("users").select("id", count="exact").gte("created_at", since).execute()).count or 0
-        users_with_session = (db.table("chat_sessions").select("user_id", count="estimated").gte("created_at", since).execute()).count or 0
-        users_with_msg = (db.table("messages").select("id", count="estimated").gte("created_at", since).execute()).count or 0
-        pro_users = (db.table("users").select("id", count="exact").neq("plan", "free").execute()).count or 0
-
-        return success_response({
-            "period_days": days,
-            "stages": [
-                {"stage": "Total Users", "users": total_users, "conversion": 100.0},
-                {"stage": "New Signups", "users": new_users, "conversion": round(new_users / max(total_users, 1) * 100, 2)},
-                {"stage": "Created Session", "users": users_with_session, "conversion": round(users_with_session / max(new_users, 1) * 100, 2)},
-                {"stage": "Sent Messages", "users": users_with_msg, "conversion": round(users_with_msg / max(users_with_session, 1) * 100, 2)},
-                {"stage": "Paid Plan", "users": pro_users, "conversion": round(pro_users / max(total_users, 1) * 100, 2)},
-            ]
-        })
+        res = db.rpc("fn_analytics_funnel", {"p_days": days}).execute()
+        payload = _unwrap_rpc_jsonb(res.data)
+        if not payload.get("stages"):
+            payload = {"period_days": days, "stages": []}
+        return success_response(payload)
     except Exception as e:
         logger.error("analytics_funnel error: %s", e)
         return error_response(str(e), 500)
@@ -586,19 +592,30 @@ async def analytics_funnel(
 
 @router.get("/analytics/geo")
 async def analytics_geo(admin: Dict = Depends(get_admin_user)):
-    """Répartition géographique des utilisateurs par langue."""
+    """Répartition par langue et par pays (country_code sur users)."""
     db = _db()
     if not db:
         return error_response("Base indisponible", 503)
     try:
-        res = db.table("users").select("language").execute()
+        res = db.table("users").select("language, country_code").execute()
         data = res.data or []
         lang_count: Dict[str, int] = {}
+        country_count: Dict[str, int] = {}
         for row in data:
             lang = row.get("language", "fr") or "fr"
             lang_count[lang] = lang_count.get(lang, 0) + 1
+            raw_cc = row.get("country_code")
+            if raw_cc is None:
+                continue
+            cc = str(raw_cc).strip().upper()
+            if len(cc) == 2 and cc.isalpha():
+                country_count[cc] = country_count.get(cc, 0) + 1
+
+        by_lang = [{"language": k, "count": v} for k, v in sorted(lang_count.items(), key=lambda x: -x[1])]
+        by_country = [{"country": k, "count": v} for k, v in sorted(country_count.items(), key=lambda x: -x[1])]
         return success_response({
-            "by_language": [{"language": k, "count": v} for k, v in lang_count.items()],
+            "by_language": by_lang,
+            "by_country": by_country,
             "total": len(data),
         })
     except Exception as e:

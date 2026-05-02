@@ -9,6 +9,7 @@ import csv
 import io
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from math import ceil
@@ -28,6 +29,11 @@ from services.user_intel_service import (
     dispatch_user_webhooks_sync,
     load_active_webhooks,
     mask_email,
+)
+from services.admin_nl_heuristic import (
+    assistant_reply,
+    effective_user_list_params,
+    parse_nl_user_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,6 +215,24 @@ class WebhookUpsertRequest(BaseModel):
 class SettingUpdateRequest(BaseModel):
     value: Any
     description: Optional[str] = None
+
+
+class NlSearchRequest(BaseModel):
+    """Recherche utilisateurs en langage naturel (phase heuristique)."""
+
+    query: str
+    search: Optional[str] = None
+    plan: Optional[str] = None
+    status: Optional[str] = None
+    country_code: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    tags: Optional[str] = None
+
+
+class AssistantChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
 
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -473,6 +497,132 @@ async def list_users(
     except Exception as e:
         logger.error("list_users error: %s", e)
         return error_response(str(e), 500)
+
+
+@router.post("/users/nl-search")
+async def nl_search_users(
+    body: NlSearchRequest,
+    request: Request,
+    admin: Dict = Depends(get_admin_user),
+):
+    """
+    Interprète une phrase (FR/EN) en filtres + compte les utilisateurs correspondants.
+    Journalise dans admin_nl_search_log si la table existe.
+    """
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+
+    t0 = time.perf_counter()
+    parsed = parse_nl_user_query(body.query)
+    parsed_public = {k: v for k, v in parsed.items() if not str(k).startswith("_")}
+    eff = effective_user_list_params(
+        parsed,
+        search=body.search,
+        plan=body.plan,
+        status=body.status,
+        country_code=body.country_code,
+        date_from=body.date_from,
+        date_to=body.date_to,
+        tags=body.tags,
+    )
+    tag_list = _parse_tags_param(eff.get("tags"))
+    tag_ids = _user_ids_matching_all_tags(db, tag_list)
+    if tag_ids is not None and len(tag_ids) == 0:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _log_nl_search(db, admin, body.query, parsed_public, 0, ms)
+        return success_response(
+            {
+                "parsed_filters": parsed_public,
+                "effective_filters": {k: v for k, v in eff.items() if v},
+                "result_count": 0,
+                "latency_ms": ms,
+                "model_version": "heuristic_nl_v1",
+            }
+        )
+
+    try:
+        count_q = _apply_user_list_filters(
+            db.table("v_admin_users_full").select("id", count="exact"),
+            eff.get("search"),
+            eff.get("plan"),
+            eff.get("status"),
+            eff.get("country_code"),
+            eff.get("date_from"),
+            eff.get("date_to"),
+            tag_ids,
+        )
+        count_res = count_q.execute()
+        total = count_res.count or 0
+    except Exception as e:
+        logger.error("nl_search_users count error: %s", e)
+        return error_response(str(e), 500)
+
+    ms = int((time.perf_counter() - t0) * 1000)
+    _log_nl_search(db, admin, body.query, {**parsed_public, **{k: v for k, v in eff.items() if v}}, total, ms)
+
+    return success_response(
+        {
+            "parsed_filters": parsed_public,
+            "effective_filters": {k: v for k, v in eff.items() if v},
+            "result_count": total,
+            "latency_ms": ms,
+            "model_version": "heuristic_nl_v1",
+            "notes": parsed.get("_nl_note"),
+        }
+    )
+
+
+def _log_nl_search(db: Any, admin: Dict, query_text: str, parsed: Dict, result_count: int, latency_ms: int) -> None:
+    try:
+        db.table("admin_nl_search_log").insert(
+            {
+                "admin_id": admin.get("id"),
+                "query_text": query_text[:4000],
+                "parsed_filters": parsed,
+                "result_count": result_count,
+                "latency_ms": latency_ms,
+                "model_version": "heuristic_nl_v1",
+            }
+        ).execute()
+    except Exception as e:
+        logger.warning("admin_nl_search_log insert skipped: %s", e)
+
+
+@router.post("/assistant/chat")
+async def admin_assistant_chat(
+    body: AssistantChatRequest,
+    admin: Dict = Depends(get_admin_user),
+):
+    """
+    Assistant guidage (sans LLM) : réponses basées sur routes + KPIs réels si disponibles.
+    """
+    db = _db()
+    kpis: Dict[str, Any] = {}
+    if db:
+        try:
+            kpi_res = db.rpc("fn_dashboard_kpis").execute()
+            raw = kpi_res.data
+            if isinstance(raw, dict):
+                inner = raw.get("kpis")
+                kpis = inner if isinstance(inner, dict) else raw
+            elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+                row = raw[0]
+                inner = row.get("kpis")
+                kpis = inner if isinstance(inner, dict) else row
+        except Exception as e:
+            logger.debug("assistant_chat KPI optional: %s", e)
+
+    out = assistant_reply(body.message, kpis=kpis or None)
+    _audit(
+        admin,
+        "assistant_chat",
+        "admin_assistant",
+        body.conversation_id,
+        {"message_len": len(body.message or "")},
+        None,
+    )
+    return success_response(out)
 
 
 @router.get("/users/{user_id}")

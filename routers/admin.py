@@ -5,12 +5,16 @@ Utilise le client service_role (bypass RLS) pour accès complet aux données.
 Authentification via JWT admin séparé du JWT utilisateur.
 """
 
+import csv
+import io
+import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from math import ceil
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 
@@ -18,6 +22,13 @@ from core.config import get_settings
 from core.database import get_supabase_admin
 from core.responses import error_response, success_response
 from core.security import create_access_token, get_subject_from_token
+from services.user_intel_service import (
+    apply_list_mask,
+    compute_ml_profile,
+    dispatch_user_webhooks_sync,
+    load_active_webhooks,
+    mask_email,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -76,6 +87,53 @@ def _db():
     return get_supabase_admin()
 
 
+def _parse_tags_param(tags: Optional[str]) -> List[str]:
+    if not tags:
+        return []
+    return [t.strip() for t in tags.split(",") if t.strip()]
+
+
+def _user_ids_matching_all_tags(db: Any, tag_list: List[str]) -> Optional[Set[str]]:
+    """AND logique sur les tags ; None si aucun filtre tag."""
+    if not tag_list:
+        return None
+    sets: List[Set[str]] = []
+    for t in tag_list:
+        r = db.table("admin_user_tags").select("user_id").eq("tag", t).execute()
+        sets.append({row["user_id"] for row in (r.data or [])})
+    out = sets[0].copy()
+    for s in sets[1:]:
+        out &= s
+    return out
+
+
+def _search_or_clause(term: str) -> str:
+    parts = [f"email.ilike.%{term}%", f"full_name.ilike.%{term}%"]
+    if len(term) == 36 and term.count("-") == 4:
+        parts.append(f"id.eq.{term}")
+    return ",".join(parts)
+
+
+def _apply_user_list_filters(q: Any, search: Optional[str], plan: Optional[str], status: Optional[str],
+                             country_code: Optional[str], date_from: Optional[str], date_to: Optional[str],
+                             tag_ids: Optional[Set[str]]) -> Any:
+    if search:
+        q = q.or_(_search_or_clause(search.strip()))
+    if plan and plan != "all":
+        q = q.eq("plan", plan)
+    if status and status != "all":
+        q = q.eq("status", status)
+    if country_code:
+        q = q.eq("country_code", country_code.strip().upper()[:2])
+    if date_from:
+        q = q.gte("created_at", date_from)
+    if date_to:
+        q = q.lte("created_at", date_to)
+    if tag_ids is not None:
+        q = q.in_("id", list(tag_ids)[:2000])
+    return q
+
+
 def _audit(admin: Dict, action: str, entity_type: str = None,
            entity_id: str = None, changes: Dict = None, request: Request = None):
     """Enregistre une action dans l'audit log."""
@@ -125,6 +183,27 @@ class UpdateUserRequest(BaseModel):
     plan: Optional[str] = None
     full_name: Optional[str] = None
     language: Optional[str] = None
+    country_code: Optional[str] = None
+
+
+class AdminNoteCreate(BaseModel):
+    content: str
+
+
+class AdminNoteUpdate(BaseModel):
+    content: str
+
+
+class UserActionRequest(BaseModel):
+    action: str
+    params: Optional[Dict[str, Any]] = None
+
+
+class WebhookUpsertRequest(BaseModel):
+    url: str
+    events: List[str]
+    secret: Optional[str] = None
+    is_active: bool = True
 
 
 class SettingUpdateRequest(BaseModel):
@@ -289,63 +368,107 @@ async def dashboard_realtime(admin: Dict = Depends(get_admin_user)):
 @router.get("/users")
 async def list_users(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(50, ge=1, le=500),
     search: Optional[str] = Query(None),
     plan: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    country_code: Optional[str] = Query(None),
+    tags: Optional[str] = Query(None, description="Tags séparés par virgule (AND)"),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
     sort: Optional[str] = Query("created_at"),
     order: Optional[str] = Query("desc"),
+    cursor: Optional[str] = Query(None, description="UUID — pagination curseur (sort=id)"),
     admin: Dict = Depends(get_admin_user),
 ):
     """
-    Liste paginée des utilisateurs avec stats enrichies.
-    Source: vue v_admin_users_full (JOIN users + usage_logs + moderation_queue).
+    Liste paginée (offset ou curseur sur `id`), emails masqués, filtres étendus.
     """
     db = _db()
     if not db:
         return error_response("Base indisponible", 503)
 
     try:
-        # Valid sort columns
-        valid_sorts = {"created_at", "email", "plan", "total_tokens_used", "requests_today"}
+        valid_sorts = {"created_at", "email", "plan", "total_tokens_used", "requests_today", "id", "risk_score"}
         sort_col = sort if sort in valid_sorts else "created_at"
         sort_desc = order.lower() != "asc"
+        tag_list = _parse_tags_param(tags)
+        tag_ids = _user_ids_matching_all_tags(db, tag_list)
+        if tag_ids is not None and len(tag_ids) == 0:
+            return success_response({
+                "users": [],
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": 0,
+                    "total_pages": 1,
+                    "next_cursor": None,
+                    "has_more": False,
+                    "mode": "offset",
+                },
+                "stats": {},
+            })
 
-        q = db.table("v_admin_users_full").select("*")
+        stats = {}
+        try:
+            kpi_res = db.rpc("fn_dashboard_kpis").execute()
+            stats = kpi_res.data if isinstance(kpi_res.data, dict) else {}
+        except Exception:
+            pass
 
-        # Filters
-        if search:
-            q = q.or_(f"email.ilike.%{search}%,full_name.ilike.%{search}%")
-        if plan and plan != "all":
-            q = q.eq("plan", plan)
+        use_cursor = bool(cursor and sort_col == "id")
+        q = _apply_user_list_filters(
+            db.table("v_admin_users_full").select("*"),
+            search, plan, status, country_code, date_from, date_to, tag_ids,
+        )
+        if use_cursor:
+            q = q.lt("id", cursor)
+            q = q.order("id", desc=True).limit(page_size)
+            res = q.execute()
+            users = res.data or []
+            next_c = users[-1]["id"] if len(users) == page_size and users else None
+            return success_response({
+                "users": apply_list_mask(users),
+                "pagination": {
+                    "page": 1,
+                    "page_size": page_size,
+                    "total": None,
+                    "total_pages": None,
+                    "next_cursor": next_c,
+                    "has_more": len(users) == page_size,
+                    "mode": "cursor",
+                },
+                "stats": stats,
+            })
 
-        # Status filter via computed column
-        if status and status != "all":
-            q = q.eq("status", status)
-
-        # Count total (approximate via separate query)
-        count_q = db.table("users").select("id", count="exact")
-        if search:
-            count_q = count_q.or_(f"email.ilike.%{search}%,full_name.ilike.%{search}%")
-        if plan and plan != "all":
-            count_q = count_q.eq("plan", plan)
+        count_q = _apply_user_list_filters(
+            db.table("v_admin_users_full").select("id", count="exact"),
+            search, plan, status, country_code, date_from, date_to, tag_ids,
+        )
         count_res = count_q.execute()
         total = count_res.count or 0
 
-        # Paginate
         offset = (page - 1) * page_size
+        q = _apply_user_list_filters(
+            db.table("v_admin_users_full").select("*"),
+            search, plan, status, country_code, date_from, date_to, tag_ids,
+        )
         q = q.order(sort_col, desc=sort_desc).range(offset, offset + page_size - 1)
         res = q.execute()
         users = res.data or []
 
         return success_response({
-            "users": users,
+            "users": apply_list_mask(users),
             "pagination": {
                 "page": page,
                 "page_size": page_size,
                 "total": total,
                 "total_pages": ceil(total / page_size) if total else 1,
-            }
+                "next_cursor": None,
+                "has_more": offset + len(users) < total,
+                "mode": "offset",
+            },
+            "stats": stats,
         })
     except Exception as e:
         logger.error("list_users error: %s", e)
@@ -391,6 +514,35 @@ async def get_user(user_id: str, admin: Dict = Depends(get_admin_user)):
         docs_res = db.table("documents").select("id, filename, file_type, file_size, created_at") \
             .eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
 
+        tags_list: List[Dict] = []
+        notes_list: List[Dict] = []
+        ml_row: Optional[Dict] = None
+        try:
+            tags_list = (db.table("admin_user_tags").select("tag, tagged_at, tagged_by")
+                         .eq("user_id", user_id).execute()).data or []
+        except Exception:
+            pass
+        try:
+            notes_list = (db.table("admin_user_notes").select("id, content, admin_id, created_at, updated_at")
+                          .eq("user_id", user_id).order("created_at", desc=True).limit(30).execute()).data or []
+        except Exception:
+            pass
+        try:
+            ml_r = db.table("user_ml_profiles").select("*").eq("user_id", user_id).limit(1).execute()
+            ml_row = ml_r.data[0] if ml_r.data else None
+        except Exception:
+            pass
+
+        predictions = compute_ml_profile(user)
+        scores = {
+            "engagement_score": predictions["engagement_score"],
+            "churn_risk": predictions["churn_risk"],
+            "upsell_propensity": predictions.get("upsell_propensity"),
+            "ltv_estimate_usd": predictions.get("ltv_estimate_usd"),
+            "health_label": predictions.get("health_label"),
+            "cached_profile": ml_row,
+        }
+
         return success_response({
             "user": user,
             "recent_sessions": sessions_res.data or [],
@@ -398,9 +550,383 @@ async def get_user(user_id: str, admin: Dict = Depends(get_admin_user)):
             "daily_requests_30d": len(daily_res.data or []),
             "moderation_flags": flags_res.data or [],
             "documents": docs_res.data or [],
+            "tags": tags_list,
+            "admin_notes": notes_list,
+            "scores": scores,
+            "predictions": predictions,
         })
     except Exception as e:
         logger.error("get_user error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.get("/users/{user_id}/activity")
+async def get_user_activity(
+    user_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(40, ge=1, le=100),
+    admin: Dict = Depends(get_admin_user),
+):
+    """Timeline agrégée : usage_logs + entrées modération récentes."""
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        chk = db.table("v_admin_users_full").select("id").eq("id", user_id).limit(1).execute()
+        if not chk.data:
+            return error_response("Utilisateur introuvable", 404)
+        offset = (page - 1) * limit
+        ul = db.table("usage_logs").select(
+            "id, endpoint, model_used, tokens_used, request_duration_ms, status_code, created_at"
+        ).eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        events = []
+        for row in ul.data or []:
+            events.append({
+                "type": "api_request",
+                "at": row.get("created_at"),
+                "title": row.get("endpoint") or "request",
+                "detail": {
+                    "model_used": row.get("model_used"),
+                    "tokens_used": row.get("tokens_used"),
+                    "status_code": row.get("status_code"),
+                },
+            })
+        mq = db.table("moderation_queue").select("id, status, content_preview, flagged_at, decision_reason") \
+            .eq("user_id", user_id).order("flagged_at", desc=True).limit(15).execute()
+        for row in mq.data or []:
+            events.append({
+                "type": "moderation",
+                "at": row.get("flagged_at"),
+                "title": f"Moderation: {row.get('status')}",
+                "detail": {"preview": (row.get("content_preview") or "")[:200], "reason": row.get("decision_reason")},
+            })
+        events.sort(key=lambda x: (x.get("at") or ""), reverse=True)
+        return success_response({"events": events[:limit], "page": page})
+    except Exception as e:
+        logger.error("get_user_activity error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.get("/users/{user_id}/media")
+async def get_user_media(
+    user_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(24, ge=1, le=100),
+    admin: Dict = Depends(get_admin_user),
+):
+    """Fichiers générés + images (deux sources)."""
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        chk = db.table("users").select("id").eq("id", user_id).limit(1).execute()
+        if not chk.data:
+            return error_response("Utilisateur introuvable", 404)
+        offset = (page - 1) * limit
+        files = db.table("generated_files").select("id, file_type, filename, prompt_used, created_at") \
+            .eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        imgs = db.table("generated_images").select(
+            "id, original_prompt, image_url, watermarked_url, generation_cost, created_at"
+        ).eq("user_id", user_id).order("created_at", desc=True).range(0, limit - 1).execute()
+        items = []
+        for f in files.data or []:
+            items.append({"kind": "file", **f})
+        for im in imgs.data or []:
+            items.append({
+                "kind": "image",
+                "id": im.get("id"),
+                "prompt": im.get("original_prompt"),
+                "url": im.get("watermarked_url") or im.get("image_url"),
+                "cost": im.get("generation_cost"),
+                "created_at": im.get("created_at"),
+            })
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        return success_response({"items": items[:limit], "page": page})
+    except Exception as e:
+        logger.error("get_user_media error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.get("/users/{user_id}/notes")
+async def list_user_notes(user_id: str, admin: Dict = Depends(get_admin_user)):
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        res = db.table("admin_user_notes").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+        return success_response({"notes": res.data or []})
+    except Exception as e:
+        logger.error("list_user_notes error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.post("/users/{user_id}/notes")
+async def create_user_note(
+    user_id: str,
+    body: AdminNoteCreate,
+    request: Request,
+    admin: Dict = Depends(get_admin_user),
+):
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        row = {
+            "user_id": user_id,
+            "admin_id": admin["id"],
+            "content": body.content,
+        }
+        res = db.table("admin_user_notes").insert(row).execute()
+        _audit(admin, "user_note_create", "users", user_id, {}, request)
+        return success_response(res.data[0] if res.data else row, "Note créée")
+    except Exception as e:
+        logger.error("create_user_note error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.put("/users/{user_id}/notes/{note_id}")
+async def update_user_note(
+    user_id: str,
+    note_id: str,
+    body: AdminNoteUpdate,
+    request: Request,
+    admin: Dict = Depends(get_admin_user),
+):
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        res = db.table("admin_user_notes").update({"content": body.content, "updated_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("id", note_id).eq("user_id", user_id).execute()
+        _audit(admin, "user_note_update", "users", user_id, {"note_id": note_id}, request)
+        return success_response(res.data[0] if res.data else {}, "Note mise à jour")
+    except Exception as e:
+        logger.error("update_user_note error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.post("/users/{user_id}/tags")
+async def add_user_tag(
+    user_id: str,
+    request: Request,
+    tag: str = Query(..., min_length=1, max_length=64),
+    admin: Dict = Depends(get_admin_user),
+):
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        row = {"user_id": user_id, "tag": tag.strip(), "tagged_by": admin["id"]}
+        db.table("admin_user_tags").upsert(row).execute()
+        _audit(admin, "user_tag_add", "users", user_id, {"tag": tag}, request)
+        hooks = load_active_webhooks(db)
+        dispatch_user_webhooks_sync(hooks, "user.tagged", {"user_id": user_id, "tag": tag})
+        return success_response(row, "Tag ajouté")
+    except Exception as e:
+        logger.error("add_user_tag error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.delete("/users/{user_id}/tags/{tag}")
+async def remove_user_tag(
+    user_id: str,
+    tag: str,
+    request: Request,
+    admin: Dict = Depends(get_admin_user),
+):
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        db.table("admin_user_tags").delete().eq("user_id", user_id).eq("tag", tag).execute()
+        _audit(admin, "user_tag_remove", "users", user_id, {"tag": tag}, request)
+        return success_response({"removed": True})
+    except Exception as e:
+        logger.error("remove_user_tag error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.post("/users/{user_id}/actions")
+async def user_actions(
+    user_id: str,
+    body: UserActionRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    admin: Dict = Depends(get_admin_user),
+):
+    """Actions unifiées : change_plan, offer_credits (audit), send_email (stub), delete_data, ban."""
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    params = body.params or {}
+    try:
+        if body.action == "change_plan":
+            plan = params.get("plan", "free")
+            db.table("users").update({"plan": plan}).eq("id", user_id).execute()
+            _audit(admin, "user_action_change_plan", "users", user_id, {"plan": plan}, request)
+        elif body.action == "offer_credits":
+            _audit(admin, "user_action_offer_credits", "users", user_id, params, request)
+        elif body.action == "send_email":
+            _audit(admin, "user_action_send_email", "users", user_id, params, request)
+        elif body.action == "ban":
+            reason = params.get("reason", "admin")
+            db.table("moderation_queue").insert({
+                "user_id": user_id,
+                "content_type": "text",
+                "content_preview": f"[BAN ADMIN] Raison: {reason}",
+                "ai_scores": {},
+                "ai_confidence": 100,
+                "priority": 100,
+                "status": "banned",
+                "reviewed_by": admin["id"],
+                "decision_reason": reason,
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            _audit(admin, "ban_user", "users", user_id, {"reason": reason}, request)
+        elif body.action == "delete_data":
+            if admin["role"] not in ("super_admin", "admin"):
+                return error_response("Permissions insuffisantes", 403)
+            for tbl in (
+                "usage_logs", "notifications", "generated_files", "documents", "moderation_queue",
+                "admin_user_notes", "admin_user_tags", "user_ml_profiles",
+            ):
+                try:
+                    db.table(tbl).delete().eq("user_id", user_id).execute()
+                except Exception:
+                    pass
+            try:
+                db.table("generated_images").delete().eq("user_id", user_id).execute()
+            except Exception:
+                pass
+            db.table("chat_sessions").delete().eq("user_id", user_id).execute()
+            _audit(admin, "delete_user_data", "users", user_id, {}, request)
+        else:
+            return error_response(f"Action inconnue: {body.action}", 400)
+
+        hooks = load_active_webhooks(db)
+        background_tasks.add_task(
+            dispatch_user_webhooks_sync,
+            hooks,
+            "user.action",
+            {"user_id": user_id, "action": body.action, "params": params},
+        )
+        return success_response({"ok": True}, "Action exécutée")
+    except Exception as e:
+        logger.error("user_actions error: %s", e)
+        return error_response(str(e), 500)
+
+
+@router.get("/users-export/stream")
+async def export_users_stream(
+    format: str = Query("csv", pattern="^(csv|json)$"),
+    plan: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    admin: Dict = Depends(get_admin_user),
+):
+    """Export paginé en flux (pas de chargement millions de lignes d’un coup)."""
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    batch = 500
+    max_rows = 100_000
+
+    def row_iter():
+        offset = 0
+        n = 0
+        while n < max_rows:
+            q = db.table("v_admin_users_full").select(
+                "id, email, full_name, plan, status, country_code, created_at, total_tokens_used, risk_score"
+            )
+            if plan and plan != "all":
+                q = q.eq("plan", plan)
+            if status and status != "all":
+                q = q.eq("status", status)
+            chunk = q.order("created_at", desc=True).range(offset, offset + batch - 1).execute()
+            rows = chunk.data or []
+            if not rows:
+                break
+            for u in rows:
+                u = dict(u)
+                u["email"] = mask_email(u.get("email"))
+                yield u
+            n += len(rows)
+            offset += batch
+            if len(rows) < batch:
+                break
+
+    if format == "json":
+
+        def gen_json():
+            yield "["
+            first = True
+            for u in row_iter():
+                if not first:
+                    yield ","
+                first = False
+                yield json.dumps(u, default=str)
+            yield "]"
+
+        return StreamingResponse(gen_json(), media_type="application/json", headers={
+            "Content-Disposition": 'attachment; filename="users_export.json"',
+        })
+
+    def gen_csv():
+        buf = io.StringIO()
+        writer: Optional[csv.DictWriter] = None
+        for u in row_iter():
+            if writer is None:
+                writer = csv.DictWriter(buf, fieldnames=list(u.keys()))
+                writer.writeheader()
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+            writer.writerow(u)
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+    return StreamingResponse(gen_csv(), media_type="text/csv; charset=utf-8", headers={
+        "Content-Disposition": 'attachment; filename="users_export.csv"',
+    })
+
+
+@router.get("/webhooks")
+async def list_webhooks(admin: Dict = Depends(get_admin_user)):
+    if admin["role"] not in ("super_admin", "admin"):
+        return error_response("Accès refusé", 403)
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        res = db.table("admin_webhooks").select("id, url, events, is_active, created_at").execute()
+        return success_response({"webhooks": res.data or []})
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@router.post("/webhooks")
+async def create_webhook(
+    body: WebhookUpsertRequest,
+    request: Request,
+    admin: Dict = Depends(get_admin_user),
+):
+    if admin["role"] not in ("super_admin", "admin"):
+        return error_response("Accès refusé", 403)
+    db = _db()
+    if not db:
+        return error_response("Base indisponible", 503)
+    try:
+        row = {
+            "url": body.url,
+            "events": body.events,
+            "secret": body.secret,
+            "is_active": body.is_active,
+            "created_by": admin["id"],
+        }
+        res = db.table("admin_webhooks").insert(row).execute()
+        _audit(admin, "webhook_create", "admin_webhooks", res.data[0]["id"] if res.data else None, {}, request)
+        return success_response(res.data[0] if res.data else row)
+    except Exception as e:
         return error_response(str(e), 500)
 
 
@@ -409,6 +935,7 @@ async def update_user(
     user_id: str,
     body: UpdateUserRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     admin: Dict = Depends(get_admin_user),
 ):
     """Met à jour le profil ou le plan d'un utilisateur."""
@@ -421,7 +948,10 @@ async def update_user(
             return error_response("Aucune donnée à mettre à jour", 400)
         res = db.table("users").update(update_data).eq("id", user_id).execute()
         _audit(admin, "update_user", "users", user_id, {"changes": update_data}, request)
-        return success_response(res.data[0] if res.data else {}, "Utilisateur mis à jour")
+        urow = res.data[0] if res.data else {"id": user_id, **update_data}
+        hooks = load_active_webhooks(db)
+        background_tasks.add_task(dispatch_user_webhooks_sync, hooks, "user.updated", {"user": urow})
+        return success_response(urow, "Utilisateur mis à jour")
     except Exception as e:
         logger.error("update_user error: %s", e)
         return error_response(str(e), 500)
@@ -476,13 +1006,20 @@ async def delete_user_data(
     if admin["role"] not in ("super_admin", "admin"):
         return error_response("Permissions insuffisantes", 403)
     try:
-        # Delete cascades via FK: sessions, messages, documents, usage_logs, notifications
         db.table("usage_logs").delete().eq("user_id", user_id).execute()
         db.table("notifications").delete().eq("user_id", user_id).execute()
         db.table("generated_files").delete().eq("user_id", user_id).execute()
         db.table("documents").delete().eq("user_id", user_id).execute()
         db.table("moderation_queue").delete().eq("user_id", user_id).execute()
-        # Sessions cascade to messages
+        for tbl in ("admin_user_notes", "admin_user_tags", "user_ml_profiles"):
+            try:
+                db.table(tbl).delete().eq("user_id", user_id).execute()
+            except Exception:
+                pass
+        try:
+            db.table("generated_images").delete().eq("user_id", user_id).execute()
+        except Exception:
+            pass
         db.table("chat_sessions").delete().eq("user_id", user_id).execute()
         _audit(admin, "delete_user_data", "users", user_id, {}, request)
         return success_response({"deleted": True}, "Données utilisateur supprimées (RGPD)")

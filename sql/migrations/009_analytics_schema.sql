@@ -12,17 +12,20 @@ CREATE INDEX IF NOT EXISTS idx_users_country_code
   ON public.users (country_code)
   WHERE country_code IS NOT NULL;
 
--- 2) Vue journalière : fenêtre élargie (alignée sur l’API analytics/daily max 365 jours)
-CREATE OR REPLACE VIEW public.v_daily_stats AS
+-- 2) Vue journalière : fenêtre élargie (~400 jours, jours UTC)
+--    Note : CREATE OR REPLACE ne peut pas changer le type d’une colonne → DROP puis CREATE.
+DROP VIEW IF EXISTS public.v_daily_stats CASCADE;
+
+CREATE VIEW public.v_daily_stats AS
 SELECT
   DATE(ul.created_at AT TIME ZONE 'UTC')                                       AS date,
   COUNT(*)::BIGINT                                                             AS total_requests,
   COUNT(DISTINCT ul.user_id)::BIGINT                                           AS active_users,
-  COALESCE(SUM(ul.tokens_used), 0)::BIGINT                                    AS total_tokens,
-  COALESCE(AVG(ul.request_duration_ms), 0)::DOUBLE PRECISION                 AS avg_latency_ms,
-  COUNT(*) FILTER (WHERE ul.status_code >= 400)::BIGINT                        AS error_count,
-  COUNT(*) FILTER (WHERE ul.status_code >= 500)::BIGINT                      AS server_errors,
-  COUNT(*) FILTER (WHERE ul.status_code = 200)::BIGINT                       AS success_count
+  COALESCE(SUM(ul.tokens_used), 0)::BIGINT                                     AS total_tokens,
+  COALESCE(AVG(ul.request_duration_ms), 0)                                     AS avg_latency_ms,
+  COUNT(*) FILTER (WHERE ul.status_code >= 400)::BIGINT                         AS error_count,
+  COUNT(*) FILTER (WHERE ul.status_code >= 500)::BIGINT                        AS server_errors,
+  COUNT(*) FILTER (WHERE ul.status_code = 200)::BIGINT                         AS success_count
 FROM public.usage_logs ul
 WHERE ul.created_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '400 days'
 GROUP BY DATE(ul.created_at AT TIME ZONE 'UTC')
@@ -30,14 +33,20 @@ ORDER BY date DESC;
 
 COMMENT ON VIEW public.v_daily_stats IS 'Statistiques journalières (usage_logs), jusqu’à ~400 jours — UTC par jour';
 
+GRANT SELECT ON public.v_daily_stats TO service_role;
+GRANT SELECT ON public.v_daily_stats TO anon;
+
 -- 3) Série journalière paramétrée (1–366 jours) pour /admin/analytics/daily
-CREATE OR REPLACE FUNCTION public.fn_daily_stats(p_days INT DEFAULT 30)
+--    Recréation si le type de retour a déjà été publié autrement.
+DROP FUNCTION IF EXISTS public.fn_daily_stats(INT);
+
+CREATE FUNCTION public.fn_daily_stats(p_days INT DEFAULT 30)
 RETURNS TABLE(
   date DATE,
   total_requests BIGINT,
   active_users BIGINT,
   total_tokens BIGINT,
-  avg_latency_ms DOUBLE PRECISION,
+  avg_latency_ms NUMERIC,
   error_count BIGINT,
   server_errors BIGINT,
   success_count BIGINT
@@ -56,7 +65,7 @@ BEGIN
     COUNT(*)::BIGINT,
     COUNT(DISTINCT ul.user_id)::BIGINT,
     COALESCE(SUM(ul.tokens_used), 0)::BIGINT,
-    COALESCE(AVG(ul.request_duration_ms), 0)::DOUBLE PRECISION,
+    COALESCE(AVG(ul.request_duration_ms), 0),
     COUNT(*) FILTER (WHERE ul.status_code >= 400)::BIGINT,
     COUNT(*) FILTER (WHERE ul.status_code >= 500)::BIGINT,
     COUNT(*) FILTER (WHERE ul.status_code = 200)::BIGINT

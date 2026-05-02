@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "name": "sayibi-backend",
+  "description": "API FastAPI (Python). L’app web Next.js est dans chadgpt-admin.",
+  "scripts": {
+    "dev": "node -e \"console.error('\\n[!] Ce dossier est le backend Python, pas Next.js.\\n\\n    Pour l’app admin web :\\n      cd ..\\\\..\\\\chadgpt-admin\\n      npm install\\n      npm run dev\\n\\n    Pour l’API (exemple) :\\n      pip install -r requirements.txt\\n      uvicorn main:app --reload\\n'); process.exit(1)\"",
+    "deb": "npm run dev"
+  }
+}

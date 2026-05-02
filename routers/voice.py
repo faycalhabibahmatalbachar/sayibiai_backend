@@ -165,7 +165,10 @@ async def get_call_log(
             return success_response([], "OK")
         res = (
             c.table("inbound_calls")
-            .select("id,caller_phone,caller_name,call_timestamp,call_duration_seconds,summary,sentiment,urgency_level,user_read")
+            .select(
+                "id,caller_phone,caller_name,call_timestamp,call_duration_seconds,"
+                "summary,transcription,sentiment,urgency_level,user_read,recording_url"
+            )
             .eq("user_id", user_id)
             .order("call_timestamp", desc=True)
             .limit(limit)

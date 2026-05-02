@@ -17,6 +17,7 @@ from middleware.user_context import UserContextMiddleware
 from services import fcm_service
 from routers import alarm, agent, agent_actions, auth, chat, documents, generate, image, internal, omni, search, user, voice
 from routers import media, social, surveillance, avatar, files, proactivity
+from routers import admin as admin_router
 
 
 @asynccontextmanager
@@ -55,15 +56,15 @@ app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
 # Origines explicites : variable CORS_ORIGINS (Render / .env).
-# Regex en complément : Flutter web en local utilise souvent http://localhost:PORT —
-# inutile de lister chaque port ; évite les erreurs « No Access-Control-Allow-Origin »
-# si l’env distant n’inclut pas exactement le port (8080, 5173, etc.).
+# Regex : localhost:any port + IP LAN (admin Next.js sur http://192.168.x.x:3000, etc.).
 _LOCALHOST_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+_LAN_ORIGIN_REGEX = r"^https?://(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$"
+_CORS_ORIGIN_REGEX = _LOCALHOST_ORIGIN_REGEX + "|" + _LAN_ORIGIN_REGEX
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
-    allow_origin_regex=_LOCALHOST_ORIGIN_REGEX,
+    allow_origin_regex=_CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,6 +90,8 @@ app.include_router(surveillance.router, prefix=f"{API}")
 app.include_router(avatar.router, prefix=f"{API}")
 app.include_router(files.router, prefix=f"{API}")
 app.include_router(proactivity.router, prefix=f"{API}")
+# Admin console — panel d'administration entreprise
+app.include_router(admin_router.router, prefix=f"{API}")
 
 
 @app.get("/health")
